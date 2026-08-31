@@ -1,0 +1,34 @@
+# Personal agent instructions stay local.
+AGENTS.md
+agents.md
+
+# Local Python environments, caches and build output.
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Secrets and local overrides; examples contain no credentials.
+.env
+.env.*
+!.env.example
+config.local.toml
+
+# Runtime data and temporary inspection files.
+data/
+logs/
+tmp/
+.dagster/
+
+# Editor and OS files.
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
