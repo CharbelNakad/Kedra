@@ -4,10 +4,13 @@ import math
 import os
 import re
 import tomllib
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+
+from pymongo import MongoClient
+from pymongo.errors import ConfigurationError, InvalidName
 
 from kedra.dates import PartitionSize
 from kedra.identity import canonical_url
@@ -79,11 +82,31 @@ class StorageSettings:
         for name in self.__dataclass_fields__:
             _text(getattr(self, name), f"storage.{name}")
         try:
-            uri = urlsplit(self.mongo_uri)
-            if uri.scheme not in ("mongodb", "mongodb+srv") or not uri.netloc:
+            if not self.mongo_uri.startswith(("mongodb://", "mongodb+srv://")):
                 raise ValueError
-        except ValueError:
-            raise ValueError("KEDRA_MONGO_URI must be a MongoDB connection URI") from None
+            with warnings.catch_warnings():
+                # PyMongo otherwise warns and ignores invalid URI options, possibly echoing secrets.
+                warnings.simplefilter("error")
+                client = MongoClient(self.mongo_uri, connect=False)
+        except (ConfigurationError, ValueError, OSError, Warning):
+            raise ValueError(
+                "KEDRA_MONGO_URI must be a valid MongoDB connection URI with supported options"
+            ) from None
+        # Disconnected handles validate names locally; no queries, DNS lookups or writes occur.
+        with client:
+            try:
+                database = client.get_database(self.mongo_database)
+            except InvalidName:
+                raise ValueError(
+                    "storage.mongo_database is not a valid MongoDB database name"
+                ) from None
+            for name in ("landing_collection", "transformed_collection", "state_collection"):
+                try:
+                    database.get_collection(getattr(self, name))
+                except InvalidName:
+                    raise ValueError(
+                        f"storage.{name} is not a valid MongoDB collection name"
+                    ) from None
         canonical_url(self.s3_endpoint_url)
         if len({self.landing_collection, self.transformed_collection, self.state_collection}) != 3:
             raise ValueError("Landing, transformed and operational collections must be distinct")

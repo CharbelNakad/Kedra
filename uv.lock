@@ -591,7 +591,7 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12,<5" },
     { name = "boto3", specifier = ">=1.35,<2" },
     { name = "dagster", specifier = ">=1.9,<2" },
-    { name = "pymongo", specifier = ">=4.10,<5" },
+    { name = "pymongo", specifier = ">=4.17,<5" },
     { name = "scrapy", specifier = ">=2.12,<3" },
 ]
 

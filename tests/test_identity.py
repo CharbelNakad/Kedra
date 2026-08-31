@@ -20,6 +20,7 @@ def record():
         source_date_raw="31/01/2014",
         source_url="https://www.workplacerelations.ie/en/cases/2014/february/te257_2012.html",
         partition_date=date(2014, 1, 1),
+        partition_size="month",
     )
 
 
@@ -32,7 +33,7 @@ def test_title_identifier_reference_and_source_date_are_distinct(record):
 
 
 def test_identity_does_not_depend_on_partition_or_source_metadata_changes(record):
-    repartitioned = replace(record, partition_date=date(2014, 1, 31))
+    repartitioned = replace(record, partition_date=date(2014, 1, 31), partition_size="day")
     changed = replace(record, title="Corrected heading", description="Corrected description")
     assert record.record_key == repartitioned.record_key == changed.record_key
     assert record.metadata_hash == repartitioned.metadata_hash
@@ -73,6 +74,52 @@ def test_reference_kind_cannot_collide_with_url_fallback():
 def test_metadata_is_immutable(record):
     with pytest.raises(FrozenInstanceError):
         record.title = "changed"
+
+
+@pytest.mark.parametrize("partition_size", ["month", "day"])
+@pytest.mark.parametrize("partition_date", [date(2013, 12, 1), date(2014, 1, 15), date(2014, 2, 1)])
+def test_metadata_rejects_incorrect_partition_labels(record, partition_size, partition_date):
+    with pytest.raises(ValueError, match="partition_date"):
+        replace(record, partition_size=partition_size, partition_date=partition_date)
+
+
+@pytest.mark.parametrize(
+    "partition_size,partition_date", [("month", date(2014, 1, 31)), ("day", date(2014, 1, 1))]
+)
+def test_metadata_rejects_labels_from_the_other_partition_mode(
+    record, partition_size, partition_date
+):
+    with pytest.raises(ValueError, match="partition_date"):
+        replace(record, partition_size=partition_size, partition_date=partition_date)
+
+
+@pytest.mark.parametrize(
+    "partition_size,published_date,partition_date",
+    [
+        ("month", date(2014, 1, 31), date(2014, 1, 1)),
+        ("day", date(2014, 1, 31), date(2014, 1, 31)),
+        ("month", date(2024, 2, 29), date(2024, 2, 1)),
+        ("day", date(2024, 2, 29), date(2024, 2, 29)),
+        ("month", date(2025, 1, 1), date(2025, 1, 1)),
+        ("day", date(2025, 1, 1), date(2025, 1, 1)),
+    ],
+)
+def test_metadata_accepts_canonical_calendar_labels(
+    record, partition_size, published_date, partition_date
+):
+    updated = replace(
+        record,
+        published_date=published_date,
+        source_date_raw=published_date.strftime("%d/%m/%Y"),
+        partition_size=partition_size,
+        partition_date=partition_date,
+    )
+    assert updated.partition_date == partition_date
+
+
+def test_metadata_rejects_unsupported_partition_mode(record):
+    with pytest.raises(ValueError, match="partition_size"):
+        replace(record, partition_size="week")
 
 
 @pytest.mark.parametrize(

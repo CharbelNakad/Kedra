@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import date
 
+from kedra.dates import PartitionSize
 from kedra.identity import canonical_url, record_key, stable_hash
 
 
@@ -17,6 +18,7 @@ class RecordMetadata:
     source_date_raw: str
     source_url: str
     partition_date: date
+    partition_size: PartitionSize
 
     def __post_init__(self) -> None:
         for name in ("source", "body_id", "title", "source_date_raw"):
@@ -29,8 +31,17 @@ class RecordMetadata:
                 raise ValueError(f"{name} must be a string or None")
         if type(self.published_date) is not date or type(self.partition_date) is not date:
             raise ValueError("Metadata dates must be calendar dates, not timestamps")
-        if self.partition_date > self.published_date:
-            raise ValueError("partition_date cannot follow published_date")
+        if self.partition_size not in ("month", "day"):
+            raise ValueError("partition_size must be month or day")
+        expected_partition = (
+            self.published_date.replace(day=1)
+            if self.partition_size == "month"
+            else self.published_date
+        )
+        if self.partition_date != expected_partition:
+            raise ValueError(
+                "partition_date must match published_date for the selected partition_size"
+            )
         canonical_url(self.source_url)
 
     @property
@@ -48,7 +59,7 @@ class RecordMetadata:
 
     @property
     def metadata_hash(self) -> str:
-        """Fingerprint source metadata, excluding partition labels and run context."""
+        """Fingerprint source metadata, excluding partition labels, size and run context."""
         return stable_hash(
             {
                 "source": self.source,

@@ -3,6 +3,7 @@
 import socket
 
 import pytest
+from dns.resolver import Resolver
 
 
 @pytest.fixture(autouse=True)
@@ -14,6 +15,8 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", reject)
     monkeypatch.setattr(socket.socket, "connect", reject)
     monkeypatch.setattr(socket.socket, "connect_ex", reject)
+    monkeypatch.setattr(socket.socket, "sendto", reject)
+    monkeypatch.setattr(Resolver, "resolve", reject)
 
 
 @pytest.fixture

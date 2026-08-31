@@ -40,6 +40,13 @@ The command validates settings and prints a small JSON partition summary without
 credentials. Both input dates are included. `partition_size` accepts `month` or
 `day`. Invalid dates, configuration or missing environment values return exit code 2.
 
+MongoDB URI options and database/collection names are validated by PyMongo using a
+temporary client with `connect=False`; database and collection handles do not create
+anything on the server. The minimum PyMongo version is 4.17, the tested baseline for
+deferring SRV DNS lookups as well as connections. Driver warnings about URI options
+are treated as errors without echoing their values. Passing this check does not prove
+DNS records, authentication, permissions or service availability.
+
 ## Validation
 
 ```powershell
@@ -57,6 +64,10 @@ connectivity, persistence or live scraping behavior.
 ## Design decisions and constraints
 
 - Monthly partitions use canonical month-start labels, even for clipped ranges.
+  `RecordMetadata` requires an explicit `partition_size`: `month` requires the first
+  day of the source date's month; `day` requires the source date itself. Incorrect
+  labels fail at construction. Changing between valid modes keeps the source identity
+  and metadata hash unchanged because partitioning describes processing, not source content.
 - Preserve the card heading as `title` and `identifier`; preserve the distinct source
   reference as `reference_number`. Internal keys use source/body/reference, falling
   back to the source URL when a reference is absent.

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,71 @@ def test_invalid_mongo_uri_does_not_disclose_its_value(example_env):
     with pytest.raises(ValueError, match="MongoDB connection URI") as error:
         load_settings(EXAMPLE, example_env)
     assert "sensitive-value" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "mongodb://localhost:bad",
+        "mongodb://localhost:65536",
+        "mongodb://localhost,,otherhost",
+        "mongodb://user:unescaped@password@localhost/",
+        "mongodb://localhost/invalid%2Fdatabase",
+        "mongodb://localhost/?connectTimeoutMS=sensitive-value",
+        "mongodb://localhost/?unknownOption=sensitive-value",
+        "mongodb+srv://cluster.example.com:27017/",
+        "mongodb+srv://one.example.com,two.example.com/",
+    ],
+)
+def test_invalid_mongo_syntax_and_options_are_rejected_offline(example_env, uri, recwarn):
+    example_env["KEDRA_MONGO_URI"] = uri
+    with pytest.raises(ValueError, match="MongoDB connection URI") as error:
+        load_settings(EXAMPLE, example_env)
+    assert uri not in str(error.value)
+    assert "sensitive-value" not in str(error.value)
+    assert not recwarn
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "mongodb://localhost:27017",
+        "mongodb://one.example.com:27017,two.example.com:27018/?replicaSet=example",
+        "mongodb://fixture-user:p%40ssword@localhost/kedra?authSource=admin",
+        "mongodb://[::1]:27017/",
+        "mongodb://localhost/?connect=true",
+        "mongodb+srv://fixture-user:fixture-password@cluster.example.com/",
+        "mongodb+srv://cluster.example.com/?connect=true",
+    ],
+)
+def test_valid_mongo_uris_do_not_require_dns_or_connections(example_env, uri):
+    example_env["KEDRA_MONGO_URI"] = uri
+    settings = load_settings(EXAMPLE, example_env)
+    assert settings.storage.mongo_uri == uri
+
+
+@pytest.mark.parametrize("invalid_character", [" ", ".", "$", "/", "\\", "\x00", '"'])
+def test_invalid_database_names_are_rejected_offline(example_env, invalid_character):
+    storage = load_settings(EXAMPLE, example_env).storage
+    with pytest.raises(ValueError, match="storage.mongo_database"):
+        replace(storage, mongo_database=f"invalid{invalid_character}database")
+
+
+@pytest.mark.parametrize(
+    "field", ["landing_collection", "transformed_collection", "state_collection"]
+)
+@pytest.mark.parametrize("name", ["invalid..collection", ".leading", "trailing.", "a$b", "a\x00b"])
+def test_invalid_collection_names_are_rejected_offline(example_env, field, name):
+    storage = load_settings(EXAMPLE, example_env).storage
+    with pytest.raises(ValueError, match=f"storage.{field}"):
+        replace(storage, **{field: name})
+
+
+def test_valid_database_and_dotted_collection_names_are_accepted(example_env):
+    storage = load_settings(EXAMPLE, example_env).storage
+    updated = replace(storage, mongo_database="kedra_test", landing_collection="landing.metadata")
+    assert updated.mongo_database == "kedra_test"
+    assert updated.landing_collection == "landing.metadata"
 
 
 @pytest.mark.parametrize(

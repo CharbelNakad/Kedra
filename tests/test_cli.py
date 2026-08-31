@@ -84,3 +84,49 @@ def test_missing_date_argument_is_rejected():
     with pytest.raises(SystemExit) as error:
         main(["check-config", "--config", EXAMPLE, "--start-date", "2024-01-01"])
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("invalid_setting", ["mongo_uri", "mongo_database", "landing_collection"])
+def test_invalid_mongo_settings_return_error_without_secrets(
+    tmp_path, monkeypatch, capsys, example_env, invalid_setting
+):
+    config = Path(EXAMPLE).read_text()
+    if invalid_setting == "mongo_uri":
+        example_env["KEDRA_MONGO_URI"] = "mongodb://fixture-user:fixture-password@localhost:bad"
+        expected_field = "KEDRA_MONGO_URI"
+    else:
+        original, invalid = (
+            ("kedra", "invalid/database")
+            if invalid_setting == "mongo_database"
+            else ("landing_metadata", "invalid..collection")
+        )
+        config = config.replace(
+            f'{invalid_setting} = "{original}"', f'{invalid_setting} = "{invalid}"'
+        )
+        expected_field = f"storage.{invalid_setting}"
+    path = tmp_path / "config.toml"
+    path.write_text(config, encoding="utf-8")
+    for name, value in example_env.items():
+        monkeypatch.setenv(name, value)
+    assert (
+        main(
+            [
+                "check-config",
+                "--config",
+                str(path),
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-31",
+            ]
+        )
+        == 2
+    )
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert expected_field in output.err
+    assert "Traceback" not in output.err
+    assert "fixture-user" not in output.err
+    assert "fixture-password" not in output.err
+    for secret in example_env.values():
+        assert secret not in output.err
