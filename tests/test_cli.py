@@ -122,18 +122,55 @@ def test_discover_cli_passes_validated_scope_to_scrapy(monkeypatch, capsys, exam
     assert capsys.readouterr().err == ""
 
 
+def test_ingest_cli_passes_validated_scope_to_scrapy(monkeypatch, capsys, example_env):
+    for name, value in example_env.items():
+        monkeypatch.setenv(name, value)
+    captured = {}
+
+    def fake_run(settings, date_range, body_ids, stream):
+        captured.update(
+            settings=settings,
+            date_range=date_range,
+            body_ids=body_ids,
+            stream=stream,
+        )
+        return 3
+
+    monkeypatch.setattr("kedra.cli.run_ingestion", fake_run)
+    result = main(
+        [
+            "ingest",
+            "--config",
+            EXAMPLE,
+            "--start-date",
+            "2025-07-17",
+            "--end-date",
+            "2025-07-17",
+            "--body-id",
+            "15376",
+        ]
+    )
+    assert result == 3
+    assert captured["body_ids"] == ["15376"]
+    assert captured["date_range"].end_exclusive.isoformat() == "2025-07-18"
+    assert captured["settings"].storage.landing_bucket == "kedra-landing"
+    assert captured["stream"] is not None
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("command", ["discover", "ingest"])
 @pytest.mark.parametrize("body_ids", [["unknown"], ["15376", "15376"]])
 def test_discover_cli_rejects_unknown_or_duplicate_body_scope(
-    monkeypatch, capsys, example_env, body_ids
+    monkeypatch, capsys, example_env, command, body_ids
 ):
     for name, value in example_env.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(
-        "kedra.cli.run_discovery",
+        f"kedra.cli.run_{'discovery' if command == 'discover' else 'ingestion'}",
         lambda *args, **kwargs: pytest.fail("invalid scope must fail before Scrapy starts"),
     )
     arguments = [
-        "discover",
+        command,
         "--config",
         EXAMPLE,
         "--start-date",

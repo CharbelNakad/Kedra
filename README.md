@@ -1,13 +1,12 @@
 # Kedra
 
 Python utilities for the Workplace Relations coding test: configuration validation,
-calendar partitions, filtered result discovery, stable document identity and persistent
-local storage primitives.
+calendar partitions, filtered result discovery, immutable decision-asset ingestion,
+stable document identity and persistent local storage.
 
-The application can preview configuration offline or use Scrapy to enumerate filtered
-result cards without following their document links. Separate administration commands
-provision local storage. Document ingestion, transformation and orchestration are not
-implemented.
+The application can preview configuration offline, enumerate filtered result cards, or use
+Scrapy to download explicit decision assets into the Landing Zone. Separate administration
+commands provision local storage. Transformation and orchestration are not implemented.
 
 ## Setup (PowerShell)
 
@@ -148,6 +147,42 @@ and never commit it. Files use owner-only creation modes on POSIX; Windows acces
 depends on the workspace's inherited ACLs. Docker secrets here are local file mounts,
 not an encrypted secret vault.
 
+## Immutable ingestion (PowerShell)
+
+After storage is healthy and the restricted ingestion profile is loaded, `ingest` runs the
+same filtered discovery and then requests each accepted decision URL. Keep initial runs to a
+small body/date scope:
+
+```powershell
+.\.venv\Scripts\python.exe -m kedra ingest --config config.example.toml `
+  --start-date 2025-07-17 --end-date 2025-07-17 --body-id 15376
+```
+
+The command recognizes HTML, PDF, DOC and DOCX using byte signatures together with MIME and
+the final URL. It saves complete response bytes without cleaning or conversion. HTML pages
+must contain substantive `.content` or an explicit decision asset. Empty wrapper pages are
+preserved and only `.related-file a.download`, `.attachments a.download`, or explicitly
+marked `data-document-asset` links are followed. Preview images, general navigation and
+off-host links are excluded. Every wrapper attachment or continuation is required for that
+record to succeed.
+
+Each object key contains the logical record key, stable asset ID, exact SHA-256 and detected
+format. The create-only object write is read back and verified before its Mongo metadata is
+inserted. If the process stops between those operations, rerunning the same bytes reuses the
+orphan object and completes the missing metadata; it never rolls Landing back. Blocking
+Mongo/S3 work is serialized in Scrapy's thread pool, outside the reactor thread.
+
+JSON Lines events distinguish downloads, storage outcomes and failures. The final
+`ingestion_run_summary` reconciles available/failed records, downloaded/stored files,
+new/reused objects and metadata versions, and failed asset URLs. Exit code 0 requires both
+complete listing enumeration and every required asset; incomplete work returns 3.
+
+The public source returned a zero-byte HTTP 200 during the bounded M3 check, so this command
+has not received a positive current live-source validation and must not be used to bypass
+that refusal. PDF/DOC/DOCX, redirects, wrappers and multi-asset behavior are verified with
+controlled fixtures. M5 still owns conditional requests and remote freshness: M4 can reuse
+identical Landing writes after bytes arrive, but it does not avoid the HTTP transfer.
+
 ### Immutable storage and its limits
 
 `ObjectStore.put_if_absent` uses `If-None-Match: *`, then reads and hashes the exact stored
@@ -184,10 +219,10 @@ Each adapter call holds one object's bytes in memory. This setup has one storage
 no replication and no automated backup or production scale validation.
 
 Mongo cannot enforce that an S3 object exists and cannot atomically commit an S3 upload.
-The typed adapter enforces object-first ordering for application writes, but code that
-bypasses it and calls PyMongo directly also bypasses the cross-store check. A future
-ingestion operation must upload and verify bytes before inserting metadata. An object
-left behind by a failed metadata insert must be reused on retry, never deleted as rollback.
+The typed adapter and ingestion service enforce object-first ordering for application
+writes, but code that bypasses them and calls PyMongo directly also bypasses the cross-store
+check. An object left behind by a failed metadata insert is reused on retry, never deleted
+as rollback.
 The few synthetic documents written before the validator was introduced remain immutable;
 Mongo applies the validator to new writes without rewriting those preserved probes.
 
@@ -238,8 +273,8 @@ uv pip check --python .venv/Scripts/python.exe --cache-dir .uv-cache
 
 Default tests use synthetic inputs with DNS/socket access blocked; storage integration
 tests are skipped unless `--storage` is supplied. Dependency/import checks do not prove
-service behavior. The opt-in checks above exercise local storage only; no tests yet
-prove live scraping or the complete ingestion/transformation pipeline.
+service behavior. The opt-in checks exercise local storage and a fixed immutable ingestion
+asset; no test proves current positive live scraping or the complete transformation pipeline.
 
 ## Design decisions and constraints
 
@@ -253,14 +288,15 @@ prove live scraping or the complete ingestion/transformation pipeline.
   back to the source URL when a reference is absent.
 - `published_date` keeps the assignment's name, but denotes the website's displayed
   decision/determination date. It is not an inferred true publication timestamp.
-- Encode unsafe filename characters reversibly, preserving the original identifier.
-  Storage paths are intended to separate source/body/record/asset versions into parent
-  directories; source-specific asset paths will be constructed during ingestion.
+- Encode unsafe output filename characters reversibly, preserving the original identifier.
+  Landing paths separate logical records, assets and exact byte hashes; transformed
+  `identifier.ext` paths remain M6 work.
 
 ## Freshness limitations
 
 The selected refresh policy uses server validators where available and fetches the
-document otherwise. This policy is not implemented or tested against live downloads.
+document otherwise. Conditional requests and operational validator state are not yet
+implemented or tested against live downloads.
 Exact-byte hashes identify downloaded bytes; without a reliable remote change signal,
 they cannot establish whether the remote document has changed without another fetch.
 

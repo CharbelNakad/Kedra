@@ -673,6 +673,27 @@ class DecisionsDiscoverySpider(scrapy.Spider):
         self.summaries[unit_key] = summary
         self._emit(summary.event())
 
+    def _accepted_record_outputs(self, record: RecordMetadata):
+        """Let discovery yield metadata while ingestion overrides the next step."""
+        yield record
+
+    def _stage_summary_fields(self, discovery_complete: bool) -> dict[str, Any]:
+        return {
+            "document_stage": "not_run",
+            "successfully_available_records": None,
+            "failed_documents": None,
+            "downloaded_files": None,
+            "download_failures": None,
+            "stored_files": None,
+            "storage_failures": None,
+        }
+
+    def _run_is_complete(self, discovery_complete: bool) -> bool:
+        return discovery_complete
+
+    def _run_summary_event(self) -> str:
+        return "discovery_run_summary"
+
     def parse_listing(self, response: HtmlResponse, unit_key: str):
         tracker = self.trackers[unit_key]
         existing_record_keys = set(tracker.records)
@@ -737,7 +758,7 @@ class DecisionsDiscoverySpider(scrapy.Spider):
                     "metadata_hash": record.metadata_hash,
                 }
             )
-            yield record
+            yield from self._accepted_record_outputs(record)
         for collision in tracker.identity_collisions[collision_count:]:
             self._emit(
                 {
@@ -794,9 +815,10 @@ class DecisionsDiscoverySpider(scrapy.Spider):
                     ),
                 )
         summaries = list(self.summaries.values())
-        complete = len(self.summaries) == len(self.trackers) and all(
+        discovery_complete = len(self.summaries) == len(self.trackers) and all(
             summary.complete for summary in summaries
         )
+        complete = self._run_is_complete(discovery_complete)
         known_totals = [
             summary.advertised_total
             for summary in summaries
@@ -810,7 +832,7 @@ class DecisionsDiscoverySpider(scrapy.Spider):
         self.exit_code = 0 if complete else 3
         self._emit(
             {
-                "event": "discovery_run_summary",
+                "event": self._run_summary_event(),
                 "source": self.app_settings.source.name,
                 "body_partition_count": len(self.trackers),
                 "complete_partitions": sum(summary.complete for summary in summaries),
@@ -832,13 +854,8 @@ class DecisionsDiscoverySpider(scrapy.Spider):
                 ],
                 "known_missing_records": sum(known_missing) if known_missing else None,
                 "partitions_with_unknown_missing_count": len(summaries) - len(known_missing),
-                "document_stage": "not_run",
-                "successfully_available_records": None,
-                "failed_documents": None,
-                "downloaded_files": None,
-                "download_failures": None,
-                "stored_files": None,
-                "storage_failures": None,
+                "discovery_complete": discovery_complete,
+                **self._stage_summary_fields(discovery_complete),
                 "complete": complete,
                 "close_reason": reason,
             }

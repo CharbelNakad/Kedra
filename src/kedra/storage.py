@@ -17,6 +17,7 @@ from kedra.identity import canonical_url, stable_hash
 from kedra.models import RecordMetadata
 
 DOCUMENT_FORMATS = frozenset({"html", "pdf", "doc", "docx"})
+ASSET_ROLES = frozenset({"primary", "wrapper", "attachment", "continuation"})
 
 
 class StorageError(RuntimeError):
@@ -100,6 +101,10 @@ class LandingVersion:
     asset_id: str
     document_format: str
     stored_object: StoredObject
+    asset_role: str | None = None
+    asset_source_url: str | None = None
+    asset_final_url: str | None = None
+    media_type: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, RecordMetadata):
@@ -123,6 +128,24 @@ class LandingVersion:
             raise ValueError("Stored object hash must be a lowercase SHA-256")
         if type(stored.size_bytes) is not int or stored.size_bytes < 0:
             raise ValueError("Stored object size must be a nonnegative integer")
+        provenance = (
+            self.asset_role,
+            self.asset_source_url,
+            self.asset_final_url,
+            self.media_type,
+        )
+        if any(value is not None for value in provenance):
+            if self.asset_role not in ASSET_ROLES:
+                raise ValueError("asset_role must be primary, wrapper, attachment or continuation")
+            for name, value in (
+                ("asset_source_url", self.asset_source_url),
+                ("asset_final_url", self.asset_final_url),
+                ("media_type", self.media_type),
+            ):
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{name} must be a nonblank string when provenance is present")
+            canonical_url(self.asset_source_url)
+            canonical_url(self.asset_final_url)
 
     @property
     def version_id(self) -> str:
@@ -140,7 +163,7 @@ class LandingVersion:
         """Serialize domain dates to BSON-compatible UTC datetimes."""
         record = self.record
         stored = self.stored_object
-        return {
+        document = {
             "_id": self.version_id,
             "schema_version": 1,
             "record_key": record.record_key,
@@ -164,6 +187,16 @@ class LandingVersion:
             "size_bytes": stored.size_bytes,
             "document_format": self.document_format,
         }
+        if self.asset_role is not None:
+            document.update(
+                {
+                    "asset_role": self.asset_role,
+                    "asset_source_url": canonical_url(self.asset_source_url),
+                    "asset_final_url": canonical_url(self.asset_final_url),
+                    "media_type": self.media_type.strip().lower(),
+                }
+            )
+        return document
 
 
 class ObjectStore:
@@ -279,7 +312,14 @@ class LandingMetadataStore:
             existing = self.find(version.version_id)
             # A valid daily and monthly run describe the same source version. Keep the
             # first immutable partition label rather than creating a processing-context copy.
-            ignored = {"partition_date", "partition_size"}
+            ignored = {
+                "partition_date",
+                "partition_size",
+                # Redirect destinations and response headers can vary while the exact
+                # immutable source bytes and logical asset version remain identical.
+                "asset_final_url",
+                "media_type",
+            }
             comparable_existing = (
                 {key: value for key, value in existing.items() if key not in ignored}
                 if existing is not None

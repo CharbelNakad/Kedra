@@ -295,6 +295,10 @@ def landing_validator() -> dict:
                 "file_hash": {"bsonType": "string", "pattern": sha256},
                 "size_bytes": {"bsonType": ["int", "long"], "minimum": 0},
                 "document_format": {"enum": ["html", "pdf", "doc", "docx"]},
+                "asset_role": {"enum": ["primary", "wrapper", "attachment", "continuation"]},
+                "asset_source_url": {"bsonType": "string", "minLength": 1},
+                "asset_final_url": {"bsonType": "string", "minLength": 1},
+                "media_type": {"bsonType": "string", "minLength": 1},
             },
         }
     }
