@@ -14,6 +14,8 @@ def no_network(monkeypatch, request):
         "--live-discovery"
     ):
         return
+    if request.node.get_closest_marker("local_http"):
+        return
 
     def reject(*args, **kwargs):
         raise AssertionError("Unit tests must not access the network")

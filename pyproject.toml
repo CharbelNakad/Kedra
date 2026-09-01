@@ -32,6 +32,7 @@ markers = [
     "storage: requires explicitly provisioned local Docker storage",
     "persistence: read-only verification of samples written before a container restart",
     "live_discovery: makes a bounded request to the configured public search source",
+    "local_http: uses a loopback-only controlled HTTP server",
 ]
 
 [tool.ruff]

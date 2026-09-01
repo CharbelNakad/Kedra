@@ -5,12 +5,13 @@ import io
 import re
 import zipfile
 from collections.abc import Iterator, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
+from pymongo.errors import PyMongoError
 from scrapy.crawler import CrawlerProcess
 from scrapy.http import HtmlResponse, Request, Response
 
@@ -25,9 +26,13 @@ from kedra.discovery import (
 from kedra.identity import canonical_url
 from kedra.models import RecordMetadata
 from kedra.storage import (
+    IntegrityError,
     LandingMetadataStore,
     LandingVersion,
+    ObjectNotFound,
     ObjectStore,
+    StorageError,
+    StoredObject,
     mongo_client,
     s3_client,
 )
@@ -52,6 +57,107 @@ class AssetLink:
     role: Literal["attachment", "continuation"]
     url: str
 
+    def __post_init__(self) -> None:
+        if not ASSET_ID_PATTERN.fullmatch(self.asset_id):
+            raise ValueError("Related asset_id is invalid")
+        if self.role not in ("attachment", "continuation"):
+            raise ValueError("Related asset role is invalid")
+        canonical_url(self.url)
+
+
+@dataclass
+class PendingAssetRequest:
+    url: str
+    attempt_count: int = 1
+
+
+@dataclass(frozen=True)
+class CachedAsset:
+    """A verified Landing object plus server validators kept outside Landing."""
+
+    state_id: str
+    source_url: str
+    asset_id: str
+    role: AssetRole
+    final_url: str
+    document_format: DocumentFormat
+    media_type: str
+    stored_object: StoredObject
+    version_id: str
+    etag: str | None = None
+    last_modified: str | None = None
+    related_assets: tuple[AssetLink, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state_id, str) or not self.state_id:
+            raise ValueError("state_id must be a nonblank string")
+        canonical_url(self.source_url)
+        canonical_url(self.final_url)
+        if not ASSET_ID_PATTERN.fullmatch(self.asset_id):
+            raise ValueError("Cached asset_id is invalid")
+        if self.role not in ("primary", "wrapper", "attachment", "continuation"):
+            raise ValueError("Cached asset role is invalid")
+        if self.document_format not in ("html", "pdf", "doc", "docx"):
+            raise ValueError("Cached document format is invalid")
+        if not isinstance(self.media_type, str) or not self.media_type.strip():
+            raise ValueError("Cached media_type must be nonblank")
+        if not isinstance(self.stored_object, StoredObject):
+            raise ValueError("Cached stored_object is invalid")
+        if not isinstance(self.version_id, str) or not self.version_id:
+            raise ValueError("Cached version_id must be nonblank")
+        for name, value in (("etag", self.etag), ("last_modified", self.last_modified)):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"Cached {name} must be nonblank when present")
+        if not isinstance(self.related_assets, tuple) or any(
+            not isinstance(link, AssetLink) for link in self.related_assets
+        ):
+            raise ValueError("Cached related assets are invalid")
+
+    @property
+    def has_validator(self) -> bool:
+        return self.etag is not None or self.last_modified is not None
+
+
+@dataclass(frozen=True)
+class CachedAssetReuse:
+    """A zero-body 304 response that reuses a previously verified Landing object."""
+
+    record: RecordMetadata
+    cached: CachedAsset
+    attempt_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, RecordMetadata):
+            raise ValueError("record must be RecordMetadata")
+        if not isinstance(self.cached, CachedAsset):
+            raise ValueError("cached must be CachedAsset")
+        if type(self.attempt_count) is not int or self.attempt_count < 1:
+            raise ValueError("attempt_count must be a positive integer")
+
+    @property
+    def asset_id(self) -> str:
+        return self.cached.asset_id
+
+    @property
+    def role(self) -> AssetRole:
+        return self.cached.role
+
+    @property
+    def source_url(self) -> str:
+        return self.cached.source_url
+
+    @property
+    def final_url(self) -> str:
+        return self.cached.final_url
+
+    @property
+    def document_format(self) -> DocumentFormat:
+        return self.cached.document_format
+
+    @property
+    def media_type(self) -> str:
+        return self.cached.media_type
+
 
 @dataclass(frozen=True)
 class DownloadedAsset:
@@ -64,6 +170,9 @@ class DownloadedAsset:
     media_type: str
     body: bytes = field(repr=False)
     attempt_count: int = 1
+    etag: str | None = None
+    last_modified: str | None = None
+    related_assets: tuple[AssetLink, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, RecordMetadata):
@@ -82,6 +191,13 @@ class DownloadedAsset:
             raise ValueError("Downloaded asset bytes must not be empty")
         if type(self.attempt_count) is not int or self.attempt_count < 1:
             raise ValueError("attempt_count must be a positive integer")
+        for name, value in (("etag", self.etag), ("last_modified", self.last_modified)):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} must be nonblank when present")
+        if not isinstance(self.related_assets, tuple) or any(
+            not isinstance(link, AssetLink) for link in self.related_assets
+        ):
+            raise ValueError("related_assets must contain AssetLink values")
 
 
 @dataclass(frozen=True)
@@ -103,9 +219,9 @@ class AssetFailure:
 @dataclass
 class IngestionRecordState:
     record: RecordMetadata
-    pending_requests: dict[str, str] = field(default_factory=dict)
+    pending_requests: dict[str, PendingAssetRequest] = field(default_factory=dict)
     seen_assets: set[str] = field(default_factory=set)
-    pending_persistence: dict[str, DownloadedAsset] = field(default_factory=dict)
+    pending_persistence: dict[str, DownloadedAsset | CachedAssetReuse] = field(default_factory=dict)
     downloaded_assets: int = 0
     stored_assets: int = 0
     stored_roles: set[str] = field(default_factory=set)
@@ -119,7 +235,6 @@ class IngestionRecordState:
             or self.pending_persistence
             or self.failures
             or not self.stored_assets
-            or self.downloaded_assets != self.stored_assets
         ):
             return False
         if self.wrapper_seen and not self.stored_roles.intersection({"attachment", "continuation"}):
@@ -128,8 +243,29 @@ class IngestionRecordState:
 
 
 def response_media_type(response: Response) -> str:
-    value = response.headers.get("Content-Type", b"application/octet-stream")
-    return value.decode("latin-1", errors="replace").split(";", 1)[0].strip().lower()
+    value = response.headers.get("Content-Type")
+    if value is None:
+        return "application/octet-stream"
+    media_type = value.decode("latin-1", errors="replace").split(";", 1)[0].strip().lower()
+    if not media_type:
+        raise AssetError("blank_content_type")
+    return media_type
+
+
+def response_validator(response: Response, header: str) -> str | None:
+    value = response.headers.get(header)
+    if value is None:
+        return None
+    decoded = value.decode("latin-1", errors="replace").strip()
+    return decoded or None
+
+
+def validator_state_id(record_key: str, source_url: str) -> str:
+    if not isinstance(record_key, str) or not record_key:
+        raise ValueError("record_key must be a nonblank string")
+    return hashlib.sha256(
+        f"source-validator\0{record_key}\0{canonical_url(source_url)}".encode()
+    ).hexdigest()
 
 
 def _is_docx(data: bytes) -> bool:
@@ -234,6 +370,47 @@ def landing_object_key(prefix: str, asset: DownloadedAsset) -> str:
     )
 
 
+class ValidatorStateStore:
+    """Keep mutable HTTP validators separate from immutable Landing metadata."""
+
+    def __init__(self, collection):
+        self._collection = collection
+
+    def find(self, record_key: str, source_url: str) -> dict[str, Any] | None:
+        state_id = validator_state_id(record_key, source_url)
+        try:
+            return self._collection.find_one({"_id": state_id})
+        except PyMongoError:
+            raise StorageError("Validator state read failed") from None
+
+    def save(
+        self,
+        version: LandingVersion,
+        source_url: str,
+        etag: str | None,
+        last_modified: str | None,
+        related_assets: tuple[AssetLink, ...],
+    ) -> None:
+        state_id = validator_state_id(version.record.record_key, source_url)
+        document = {
+            "_id": state_id,
+            "schema_version": 1,
+            "record_key": version.record.record_key,
+            "source_url": canonical_url(source_url),
+            "landing_version_id": version.version_id,
+            "related_assets": [asdict(link) for link in related_assets],
+            "updated_at": datetime.now(UTC),
+        }
+        if etag is not None:
+            document["etag"] = etag
+        if last_modified is not None:
+            document["last_modified"] = last_modified
+        try:
+            self._collection.replace_one({"_id": state_id}, document, upsert=True)
+        except PyMongoError:
+            raise StorageError("Validator state write failed") from None
+
+
 class LandingAssetService:
     """Persist one response atomically enough for safe object-first recovery."""
 
@@ -242,10 +419,61 @@ class LandingAssetService:
         object_store: ObjectStore,
         metadata_store: LandingMetadataStore,
         object_prefix: str,
+        validator_store: ValidatorStateStore | None = None,
     ):
         self.object_store = object_store
         self.metadata_store = metadata_store
         self.object_prefix = object_prefix
+        self.validator_store = validator_store
+
+    def find_reusable(self, record_key: str, source_url: str) -> CachedAsset | None:
+        if self.validator_store is None:
+            return None
+        state = self.validator_store.find(record_key, source_url)
+        if state is None or not (state.get("etag") or state.get("last_modified")):
+            return None
+        try:
+            version_id = state["landing_version_id"]
+            document = self.metadata_store.find(version_id)
+            if document is None:
+                return None
+            related = tuple(
+                AssetLink(item["asset_id"], item["role"], item["url"])
+                for item in state.get("related_assets", [])
+            )
+            stored = StoredObject(
+                document["object_bucket"],
+                document["object_key"],
+                document["file_hash"],
+                document["size_bytes"],
+                False,
+            )
+            cached = CachedAsset(
+                state_id=state["_id"],
+                source_url=state["source_url"],
+                asset_id=document["asset_id"],
+                role=document["asset_role"],
+                final_url=document["asset_final_url"],
+                document_format=document["document_format"],
+                media_type=document["media_type"],
+                stored_object=stored,
+                version_id=version_id,
+                etag=state.get("etag"),
+                last_modified=state.get("last_modified"),
+                related_assets=related,
+            )
+            if (
+                state["record_key"] != record_key
+                or document["record_key"] != record_key
+                or cached.source_url != canonical_url(source_url)
+                or cached.state_id != validator_state_id(record_key, source_url)
+            ):
+                return None
+            self.object_store.verify(stored)
+            return cached
+        except (KeyError, TypeError, ValueError, ObjectNotFound, IntegrityError):
+            # Stale or malformed mutable state is a cache miss. A full response can repair it.
+            return None
 
     def persist(self, asset: DownloadedAsset) -> PersistedAsset:
         key = landing_object_key(self.object_prefix, asset)
@@ -261,7 +489,38 @@ class LandingAssetService:
             media_type=asset.media_type,
         )
         metadata_created = self.metadata_store.insert_if_absent(version)
+        if self.validator_store is not None:
+            self.validator_store.save(
+                version,
+                asset.source_url,
+                asset.etag,
+                asset.last_modified,
+                asset.related_assets,
+            )
         return PersistedAsset(version, stored.created, metadata_created)
+
+    def reuse(self, item: CachedAssetReuse) -> PersistedAsset:
+        cached = item.cached
+        version = LandingVersion(
+            record=item.record,
+            asset_id=cached.asset_id,
+            document_format=cached.document_format,
+            stored_object=cached.stored_object,
+            asset_role=cached.role,
+            asset_source_url=cached.source_url,
+            asset_final_url=cached.final_url,
+            media_type=cached.media_type,
+        )
+        metadata_created = self.metadata_store.insert_if_absent(version)
+        if self.validator_store is not None:
+            self.validator_store.save(
+                version,
+                cached.source_url,
+                cached.etag,
+                cached.last_modified,
+                cached.related_assets,
+            )
+        return PersistedAsset(version, False, metadata_created)
 
 
 class DecisionsIngestionSpider(DecisionsDiscoverySpider):
@@ -282,6 +541,7 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
         self.asset_service = asset_service
         self.record_states: dict[str, IngestionRecordState] = {}
         self.downloaded_files = 0
+        self.not_modified_files = 0
         self.download_failures = 0
         self.stored_files = 0
         self.storage_failures = 0
@@ -306,7 +566,7 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
             return
         state = IngestionRecordState(
             record,
-            pending_requests={"primary": canonical_url(record.source_url)},
+            pending_requests={"primary": PendingAssetRequest(canonical_url(record.source_url))},
             seen_assets={"primary"},
         )
         self.record_states[record.record_key] = state
@@ -325,8 +585,24 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
                 "asset_role": role,
                 "asset_source_url": canonical_url(source_url),
             },
+            meta={
+                "handle_httpstatus_list": [304],
+                "kedra_asset_request": True,
+            },
             dont_filter=True,
         )
+
+    def note_asset_request_attempt(self, request: Request) -> None:
+        values = request.cb_kwargs
+        state = self.record_states.get(values.get("record_key"))
+        if state is None:
+            return
+        pending = state.pending_requests.get(values.get("asset_id"))
+        if pending is not None:
+            pending.attempt_count = max(
+                pending.attempt_count,
+                request.meta.get("retry_times", 0) + 1,
+            )
 
     def _source_host(self) -> str:
         return urlsplit(self.app_settings.source.search_url).hostname.lower()
@@ -342,7 +618,11 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
         *,
         storage: bool,
     ) -> None:
-        failure = AssetFailure(asset_id, canonical_url(url), reason, http_status, attempt_count)
+        try:
+            failure_url = canonical_url(url)
+        except ValueError:
+            failure_url = str(url)
+        failure = AssetFailure(asset_id, failure_url, reason, http_status, attempt_count)
         state.failures.append(failure)
         if storage:
             self.storage_failures += 1
@@ -367,16 +647,41 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
         asset_id: str,
         asset_role: AssetRole,
         asset_source_url: str,
-    ) -> Iterator[DownloadedAsset | Request]:
+    ) -> Iterator[DownloadedAsset | CachedAssetReuse | Request]:
         state = self.record_states[record_key]
-        state.pending_requests.pop(asset_id, None)
         attempt_count = response.request.meta.get("retry_times", 0) + 1
+        pending = state.pending_requests.get(asset_id)
+        if pending is not None:
+            pending.attempt_count = max(pending.attempt_count, attempt_count)
+        state.pending_requests.pop(asset_id, None)
+        failure_url = asset_source_url
         try:
-            if response.status != 200:
-                raise AssetError("unexpected_document_status")
             final_host = urlsplit(response.url).hostname
             if final_host is None or final_host.lower() != self._source_host():
+                failure_url = response.url
                 raise AssetError("document_redirected_outside_source_host")
+            if response.status == 304:
+                cached = response.request.meta.get("kedra_cached_asset")
+                if not isinstance(cached, CachedAsset) or not cached.has_validator:
+                    raise AssetError("not_modified_without_valid_cache")
+                if cached.source_url != canonical_url(asset_source_url):
+                    raise AssetError("not_modified_cache_mismatch")
+                cached = replace(
+                    cached,
+                    etag=response_validator(response, "ETag") or cached.etag,
+                    last_modified=(
+                        response_validator(response, "Last-Modified") or cached.last_modified
+                    ),
+                )
+                yield from self._schedule_related(record_key, state, cached.related_assets)
+                item = CachedAssetReuse(state.record, cached, attempt_count)
+                state.wrapper_seen = state.wrapper_seen or cached.role == "wrapper"
+                state.pending_persistence[item.asset_id] = item
+                self.not_modified_files += 1
+                yield item
+                return
+            if response.status != 200:
+                raise AssetError("unexpected_document_status")
             document_format = classify_document(response)
             role = asset_role
             stored_asset_id = asset_id
@@ -389,51 +694,62 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
                     role = "wrapper"
                     if asset_id == "primary":
                         stored_asset_id = "wrapper"
-            for link in links:
-                if urlsplit(link.url).hostname.lower() != self._source_host():
-                    self._asset_failed(
-                        state,
-                        link.asset_id,
-                        link.url,
-                        "asset_link_outside_source_host",
-                        None,
-                        1,
-                        storage=False,
-                    )
-                    continue
-                if link.asset_id in state.seen_assets:
-                    continue
-                state.seen_assets.add(link.asset_id)
-                state.pending_requests[link.asset_id] = link.url
-                yield self._asset_request(record_key, link.asset_id, link.role, link.url)
+            yield from self._schedule_related(record_key, state, links)
+            asset = DownloadedAsset(
+                record=state.record,
+                asset_id=stored_asset_id,
+                role=role,
+                source_url=asset_source_url,
+                final_url=response.url,
+                document_format=document_format,
+                media_type=response_media_type(response),
+                body=response.body,
+                attempt_count=attempt_count,
+                etag=response_validator(response, "ETag"),
+                last_modified=response_validator(response, "Last-Modified"),
+                related_assets=links,
+            )
         except (AssetError, ValueError) as error:
-            reason = error.reason if isinstance(error, AssetError) else "invalid_asset_url"
+            reason = error.reason if isinstance(error, AssetError) else "invalid_asset_response"
             self._asset_failed(
                 state,
                 asset_id,
-                asset_source_url,
+                failure_url,
                 reason,
                 response.status,
                 attempt_count,
                 storage=False,
             )
             return
-        asset = DownloadedAsset(
-            record=state.record,
-            asset_id=stored_asset_id,
-            role=role,
-            source_url=asset_source_url,
-            final_url=response.url,
-            document_format=document_format,
-            media_type=response_media_type(response),
-            body=response.body,
-            attempt_count=attempt_count,
-        )
         state.wrapper_seen = state.wrapper_seen or role == "wrapper"
         state.downloaded_assets += 1
         state.pending_persistence[asset.asset_id] = asset
         self.downloaded_files += 1
         yield asset
+
+    def _schedule_related(
+        self,
+        record_key: str,
+        state: IngestionRecordState,
+        links: tuple[AssetLink, ...],
+    ) -> Iterator[Request]:
+        for link in links:
+            if urlsplit(link.url).hostname.lower() != self._source_host():
+                self._asset_failed(
+                    state,
+                    link.asset_id,
+                    link.url,
+                    "asset_link_outside_source_host",
+                    None,
+                    1,
+                    storage=False,
+                )
+                continue
+            if link.asset_id in state.seen_assets:
+                continue
+            state.seen_assets.add(link.asset_id)
+            state.pending_requests[link.asset_id] = PendingAssetRequest(link.url)
+            yield self._asset_request(record_key, link.asset_id, link.role, link.url)
 
     def asset_request_failed(self, failure) -> None:
         request = failure.request
@@ -453,7 +769,9 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
             storage=False,
         )
 
-    def asset_persisted(self, asset: DownloadedAsset, result: PersistedAsset) -> None:
+    def asset_persisted(
+        self, asset: DownloadedAsset | CachedAssetReuse, result: PersistedAsset
+    ) -> None:
         state = self.record_states[asset.record.record_key]
         state.pending_persistence.pop(asset.asset_id, None)
         state.stored_assets += 1
@@ -483,10 +801,11 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
                 "object_key": stored.key,
                 "object_created": result.object_created,
                 "metadata_created": result.metadata_created,
+                "response_not_modified": isinstance(asset, CachedAssetReuse),
             }
         )
 
-    def asset_persist_failed(self, asset: DownloadedAsset) -> None:
+    def asset_persist_failed(self, asset: DownloadedAsset | CachedAssetReuse) -> None:
         state = self.record_states[asset.record.record_key]
         state.pending_persistence.pop(asset.asset_id, None)
         self._asset_failed(
@@ -502,6 +821,8 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
     def _stage_summary_fields(self, discovery_complete: bool) -> dict[str, Any]:
         states = list(self.record_states.values())
         successful = sum(state.complete for state in states)
+        malformed_records = sum(summary.malformed_cards for summary in self.summaries.values())
+        document_candidates = len(states) + malformed_records
         failures = [failure for state in states for failure in state.failures]
         pending = sum(
             len(state.pending_requests) + len(state.pending_persistence) for state in states
@@ -512,10 +833,11 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
                 if discovery_complete and successful == len(states) and not pending
                 else "incomplete"
             ),
-            "ingestion_records": len(states),
+            "ingestion_records": document_candidates,
             "successfully_available_records": successful,
-            "failed_documents": len(states) - successful,
+            "failed_documents": document_candidates - successful,
             "downloaded_files": self.downloaded_files,
+            "not_modified_files": self.not_modified_files,
             "download_failures": self.download_failures,
             "stored_files": self.stored_files,
             "storage_failures": self.storage_failures,
@@ -535,14 +857,14 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
 
     def closed(self, reason: str) -> None:
         for state in self.record_states.values():
-            for asset_id, url in tuple(state.pending_requests.items()):
+            for asset_id, pending in tuple(state.pending_requests.items()):
                 self._asset_failed(
                     state,
                     asset_id,
-                    url,
+                    pending.url,
                     "asset_download_not_completed",
                     None,
-                    1,
+                    pending.attempt_count,
                     storage=False,
                 )
             state.pending_requests.clear()
@@ -558,6 +880,45 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
                 )
             state.pending_persistence.clear()
         super().closed(reason)
+
+
+class ConditionalAssetMiddleware:
+    """Attach trusted validators without performing blocking storage reads on the reactor."""
+
+    def process_request(self, request: Request, spider):
+        if not isinstance(spider, DecisionsIngestionSpider) or not request.meta.get(
+            "kedra_asset_request"
+        ):
+            return None
+        spider.note_asset_request_attempt(request)
+        if request.meta.get("kedra_cache_checked"):
+            return None
+        request.meta["kedra_cache_checked"] = True
+        service = spider.asset_service
+        if service is None or service.validator_store is None:
+            return None
+
+        from twisted.internet import threads
+
+        values = request.cb_kwargs
+        deferred = threads.deferToThread(
+            service.find_reusable,
+            values["record_key"],
+            values["asset_source_url"],
+        )
+
+        def apply_validator(cached: CachedAsset | None):
+            if cached is None:
+                return None
+            request.meta["kedra_cached_asset"] = cached
+            if cached.etag is not None:
+                request.headers["If-None-Match"] = cached.etag
+            if cached.last_modified is not None:
+                request.headers["If-Modified-Since"] = cached.last_modified
+            return None
+
+        deferred.addCallback(apply_validator)
+        return deferred
 
 
 class LandingAssetPipeline:
@@ -583,15 +944,20 @@ class LandingAssetPipeline:
         self._mongo = mongo_client(settings)
         self._s3 = s3_client(settings)
         objects = ObjectStore(self._s3, settings.landing_bucket, settings.object_prefix)
-        metadata = LandingMetadataStore(
-            self._mongo[settings.mongo_database][settings.landing_collection], objects
+        database = self._mongo[settings.mongo_database]
+        metadata = LandingMetadataStore(database[settings.landing_collection], objects)
+        validators = ValidatorStateStore(database[settings.state_collection])
+        self.service = LandingAssetService(
+            objects,
+            metadata,
+            settings.object_prefix,
+            validators,
         )
-        self.service = LandingAssetService(objects, metadata, settings.object_prefix)
         spider.asset_service = self.service
         self._owns_service = True
 
     def process_item(self, item, spider):
-        if not isinstance(item, DownloadedAsset) or not isinstance(
+        if not isinstance(item, (DownloadedAsset, CachedAssetReuse)) or not isinstance(
             spider, DecisionsIngestionSpider
         ):
             return item
@@ -600,7 +966,10 @@ class LandingAssetPipeline:
             return item
         from twisted.internet import threads
 
-        deferred = threads.deferToThread(self.service.persist, item)
+        operation = (
+            self.service.reuse if isinstance(item, CachedAssetReuse) else self.service.persist
+        )
+        deferred = threads.deferToThread(operation, item)
 
         def succeeded(result):
             spider.asset_persisted(item, result)
@@ -624,6 +993,7 @@ class LandingAssetPipeline:
 
 def ingestion_crawler_settings(settings: Settings) -> dict[str, Any]:
     values = crawler_settings(settings)
+    values["DOWNLOADER_MIDDLEWARES"]["kedra.ingestion.ConditionalAssetMiddleware"] = 540
     values.update(
         {
             "ITEM_PIPELINES": {"kedra.ingestion.LandingAssetPipeline": 300},

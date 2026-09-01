@@ -174,14 +174,25 @@ Mongo/S3 work is serialized in Scrapy's thread pool, outside the reactor thread.
 
 JSON Lines events distinguish downloads, storage outcomes and failures. The final
 `ingestion_run_summary` reconciles available/failed records, downloaded/stored files,
-new/reused objects and metadata versions, and failed asset URLs. Exit code 0 requires both
-complete listing enumeration and every required asset; incomplete work returns 3.
+validator-backed `not_modified_files`, new/reused objects and metadata versions, and failed
+asset URLs. Malformed listing cards count as failed documents even though they cannot become
+metadata records. Exit code 0 requires both complete listing enumeration and every required
+asset; incomplete work returns 3.
 
-The public source returned a zero-byte HTTP 200 during the bounded M3 check, so this command
+When a successful response supplies `ETag` or `Last-Modified`, ingestion stores that opaque
+server validator in the mutable `crawl_state` collection. A later request first verifies the
+referenced Landing metadata and exact object bytes, then sends `If-None-Match` and/or
+`If-Modified-Since`. A 304 response contains no document body, so the verified object and
+metadata version are reused. A 200 response is classified and hashed normally; changed bytes
+append a new immutable object/version. Validator reads run in a worker thread and never turn
+an unverified or missing local object into a cache hit.
+
+The public source returned a zero-byte HTTP 200 during the bounded source recheck, so this command
 has not received a positive current live-source validation and must not be used to bypass
-that refusal. PDF/DOC/DOCX, redirects, wrappers and multi-asset behavior are verified with
-controlled fixtures. M5 still owns conditional requests and remote freshness: M4 can reuse
-identical Landing writes after bytes arrive, but it does not avoid the HTTP transfer.
+that refusal. PDF/DOC/DOCX, redirects, wrappers, multi-asset behavior and conditional 304
+handling are verified with controlled fixtures. The original bounded inspection showed that
+sample decision HTML had no ETag or Last-Modified. Those pages must still be fetched to detect
+silent edits; trusting the cache would avoid transfers but could return stale legal content.
 
 ### Immutable storage and its limits
 
@@ -290,13 +301,13 @@ asset; no test proves current positive live scraping or the complete transformat
   decision/determination date. It is not an inferred true publication timestamp.
 - Encode unsafe output filename characters reversibly, preserving the original identifier.
   Landing paths separate logical records, assets and exact byte hashes; transformed
-  `identifier.ext` paths remain M6 work.
+  `identifier.ext` paths remain future work.
 
 ## Freshness limitations
 
 The selected refresh policy uses server validators where available and fetches the
-document otherwise. Conditional requests and operational validator state are not yet
-implemented or tested against live downloads.
+document otherwise. Conditional requests and operational validator state pass controlled
+HTTP and local storage checks, but have not been tested against current WRC downloads.
 Exact-byte hashes identify downloaded bytes; without a reliable remote change signal,
 they cannot establish whether the remote document has changed without another fetch.
 

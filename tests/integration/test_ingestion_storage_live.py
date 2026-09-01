@@ -3,24 +3,24 @@ from datetime import date
 
 import pytest
 
-from kedra.ingestion import DownloadedAsset, LandingAssetService
+from kedra.ingestion import DownloadedAsset, LandingAssetService, ValidatorStateStore
 from kedra.models import RecordMetadata
 
 pytestmark = pytest.mark.storage
-BODY = b"<html><body><div class='content'>Fixed M4 storage check.</div></body></html>"
+BODY = b"<html><body><div class='content'>Fixed ingestion storage check.</div></body></html>"
 
 
 def test_fixed_ingestion_asset_reuses_exact_object_and_metadata(stores):
-    settings, _, _, metadata, objects = stores
+    settings, database, _, metadata, objects = stores
     record = RecordMetadata(
-        source="fixture-m4-ingestion",
+        source="fixture-ingestion",
         body_id="15376",
-        title="FIXTURE-M4-0001",
-        reference_number="FIXTURE-M4-0001",
+        title="FIXTURE-INGESTION-0001",
+        reference_number="FIXTURE-INGESTION-0001",
         description="Controlled local storage integration fixture.",
         published_date=date(2025, 7, 17),
         source_date_raw="17/07/2025",
-        source_url="https://example.invalid/fixture-m4-0001.html",
+        source_url="https://example.invalid/fixture-ingestion-0001.html",
         partition_date=date(2025, 7, 1),
         partition_size="month",
     )
@@ -29,12 +29,18 @@ def test_fixed_ingestion_asset_reuses_exact_object_and_metadata(stores):
         asset_id="primary",
         role="primary",
         source_url=record.source_url,
-        final_url="https://example.invalid/final/fixture-m4-0001.html",
+        final_url="https://example.invalid/final/fixture-ingestion-0001.html",
         document_format="html",
         media_type="text/html",
         body=BODY,
+        etag='"fixed-ingestion-etag"',
     )
-    service = LandingAssetService(objects, metadata, settings.object_prefix)
+    service = LandingAssetService(
+        objects,
+        metadata,
+        settings.object_prefix,
+        ValidatorStateStore(database[settings.state_collection]),
+    )
 
     first = service.persist(asset)
     second = service.persist(asset)
@@ -45,3 +51,7 @@ def test_fixed_ingestion_asset_reuses_exact_object_and_metadata(stores):
     assert objects.read(first.version.stored_object.key) == BODY
     assert first.version.stored_object.file_hash == hashlib.sha256(BODY).hexdigest()
     assert metadata.find(first.version.version_id) == first.version.to_document()
+    cached = service.find_reusable(record.record_key, record.source_url)
+    assert cached is not None
+    assert cached.etag == '"fixed-ingestion-etag"'
+    assert cached.stored_object.file_hash == first.version.stored_object.file_hash
