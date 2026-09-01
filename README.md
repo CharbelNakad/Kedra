@@ -1,11 +1,13 @@
 # Kedra
 
 Python utilities for the Workplace Relations coding test: configuration validation,
-calendar partitions, stable document identity and persistent local storage primitives.
+calendar partitions, filtered result discovery, stable document identity and persistent
+local storage primitives.
 
-The application command previews configuration and partitions offline. Separate
-administration commands provision local storage. Crawling, document ingestion,
-transformation and orchestration are not implemented.
+The application can preview configuration offline or use Scrapy to enumerate filtered
+result cards without following their document links. Separate administration commands
+provision local storage. Document ingestion, transformation and orchestration are not
+implemented.
 
 ## Setup (PowerShell)
 
@@ -46,6 +48,42 @@ anything on the server. The minimum PyMongo version is 4.17, the tested baseline
 deferring SRV DNS lookups as well as connections. Driver warnings about URI options
 are treated as errors without echoing their values. Passing this check does not prove
 DNS records, authentication, permissions or service availability.
+
+## Result discovery (PowerShell)
+
+`discover` sends direct filtered GET requests through Scrapy. It schedules every configured
+body for every calendar partition by default, follows only the next filtered pager link,
+and never requests a decision/document URL. Use `--body-id` to make an explicit narrower
+run; repeat the option to select more than one configured body.
+
+```powershell
+.\.venv\Scripts\python.exe -m kedra discover --config config.example.toml `
+  --start-date 2025-07-17 --end-date 2025-07-17 --body-id 15376
+```
+
+The command still validates the complete configuration, so the three storage environment
+variables shown above must be present, although discovery does not connect to storage.
+Every output line is a JSON object with a run ID and UTC timestamp. It records scheduled
+partitions, parsed pages, discovered metadata, card/listing failures, reconciled partition
+counts and a final run summary. Exit code 0 means every selected body/partition was fully
+enumerated; 2 means invalid input/configuration; 3 means discovery was incomplete.
+
+Cards use the verified `li.each-item`, `h2.title`, `p.description`, `span.date`, `.refNO`
+and `.link a` selectors. A missing description becomes `null`. An empty response or a page
+without cards and an explicit no-results message is a failure, never a zero-result success.
+The tracker rejects changed filters, skipped/repeated pages, changing totals, duplicate or
+malformed cards, count mismatches and a configured page safety limit.
+
+Scrapy obeys `robots.txt`, disables cookies, uses the configured per-domain concurrency,
+delay, timeout, retry count, response-size limit and retryable status codes including 429.
+The default page safety limit is 1,000 pages per body/partition; reaching it fails the
+partition rather than reporting truncated success. Tune these values in TOML, not source.
+
+The bounded 2026-09-01 recheck of the previously known 17 July 2025 WRC result returned
+HTTP 200 with an empty body. The command correctly reported `empty_listing_response` and
+did not request page 2 or any decision. Offline fixtures still prove the previously observed
+10+2 pagination contract, but current positive live discovery remains unverified while the
+source returns empty responses. Do not try alternate clients to bypass a source refusal.
 
 ## Local storage (PowerShell)
 

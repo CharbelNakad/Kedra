@@ -86,6 +86,67 @@ def test_missing_date_argument_is_rejected():
     assert error.value.code == 2
 
 
+def test_discover_cli_passes_validated_scope_to_scrapy(monkeypatch, capsys, example_env):
+    for name, value in example_env.items():
+        monkeypatch.setenv(name, value)
+    captured = {}
+
+    def fake_run(settings, date_range, body_ids, stream):
+        captured.update(
+            settings=settings,
+            date_range=date_range,
+            body_ids=body_ids,
+            stream=stream,
+        )
+        return 3
+
+    monkeypatch.setattr("kedra.cli.run_discovery", fake_run)
+    result = main(
+        [
+            "discover",
+            "--config",
+            EXAMPLE,
+            "--start-date",
+            "2025-07-17",
+            "--end-date",
+            "2025-07-17",
+            "--body-id",
+            "15376",
+        ]
+    )
+    assert result == 3
+    assert captured["body_ids"] == ["15376"]
+    assert captured["date_range"].start.isoformat() == "2025-07-17"
+    assert captured["settings"].source.name == "workplace-relations"
+    assert captured["stream"] is not None
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("body_ids", [["unknown"], ["15376", "15376"]])
+def test_discover_cli_rejects_unknown_or_duplicate_body_scope(
+    monkeypatch, capsys, example_env, body_ids
+):
+    for name, value in example_env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        "kedra.cli.run_discovery",
+        lambda *args, **kwargs: pytest.fail("invalid scope must fail before Scrapy starts"),
+    )
+    arguments = [
+        "discover",
+        "--config",
+        EXAMPLE,
+        "--start-date",
+        "2025-07-17",
+        "--end-date",
+        "2025-07-17",
+    ]
+    for body_id in body_ids:
+        arguments.extend(["--body-id", body_id])
+    assert main(arguments) == 2
+    assert "distinct configured" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("invalid_setting", ["mongo_uri", "mongo_database", "landing_collection"])
 def test_invalid_mongo_settings_return_error_without_secrets(
     tmp_path, monkeypatch, capsys, example_env, invalid_setting

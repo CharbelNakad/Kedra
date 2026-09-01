@@ -10,6 +10,10 @@ from dns.resolver import Resolver
 def no_network(monkeypatch, request):
     if request.node.get_closest_marker("storage") and request.config.getoption("--storage"):
         return
+    if request.node.get_closest_marker("live_discovery") and request.config.getoption(
+        "--live-discovery"
+    ):
+        return
 
     def reject(*args, **kwargs):
         raise AssertionError("Unit tests must not access the network")
@@ -24,6 +28,11 @@ def no_network(monkeypatch, request):
 
 def pytest_addoption(parser):
     parser.addoption("--storage", action="store_true", help="Enable explicit local storage checks")
+    parser.addoption(
+        "--live-discovery",
+        action="store_true",
+        help="Enable one bounded WRC discovery check",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -32,6 +41,12 @@ def pytest_collection_modifyitems(config, items):
             if item.get_closest_marker("storage"):
                 item.add_marker(
                     pytest.mark.skip(reason="Use --storage for local Docker integration checks")
+                )
+    if not config.getoption("--live-discovery"):
+        for item in items:
+            if item.get_closest_marker("live_discovery"):
+                item.add_marker(
+                    pytest.mark.skip(reason="Use --live-discovery for the bounded WRC check")
                 )
 
 

@@ -48,6 +48,7 @@ class ScrapingSettings:
     timeout_seconds: float
     retry_times: int
     max_response_bytes: int
+    max_pages_per_partition: int
 
     def __post_init__(self) -> None:
         if self.partition_size not in ("month", "day"):
@@ -56,7 +57,12 @@ class ScrapingSettings:
             value = getattr(self, name)
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"scraping.{name} must be a finite positive number")
-        for name in ("concurrency_per_domain", "retry_times", "max_response_bytes"):
+        for name in (
+            "concurrency_per_domain",
+            "retry_times",
+            "max_response_bytes",
+            "max_pages_per_partition",
+        ):
             value = getattr(self, name)
             minimum = 0 if name == "retry_times" else 1
             if type(value) is not int or value < minimum:
