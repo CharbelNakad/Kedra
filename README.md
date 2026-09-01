@@ -63,9 +63,12 @@ docker compose --env-file .local/compose.env up -d --wait --wait-timeout 90
 ```
 
 `prepare` generates random administrator, ingestion and transformation credentials in
-ignored `.local/` files. It never replaces existing credentials. `bootstrap` creates
-separate buckets/collections, date indexes, restricted Mongo roles and a Landing bucket
-policy. Repeating these commands preserves existing data and checks role/policy drift.
+ignored `.local/` files. It never replaces existing credentials. The credential manifest
+is written first; rerunning `prepare` reconstructs any missing derived secret/profile files
+from that manifest and refuses to replace files whose contents differ. `bootstrap` creates
+separate buckets/collections, date and logical-identity indexes, a validator for new
+Landing documents, restricted Mongo roles and a Landing bucket policy. Repeating these
+commands preserves existing data and checks role/policy drift.
 The container health checks cover basic process/HTTP readiness; the tests below verify
 authenticated storage operations.
 
@@ -102,10 +105,19 @@ not an encrypted secret vault.
 
 `ObjectStore.put_if_absent` uses `If-None-Match: *`, then reads and hashes the exact stored
 bytes. Existing identical bytes are reused; a conflicting object fails without repair
-or overwrite. `MetadataStore.insert_if_absent` uses Mongo's unique `_id`, reuses identical
-documents and rejects conflicting documents. Neither adapter exposes update/delete.
-Callers supply version IDs and object keys; document ingestion and asset-version
-construction are still required before these primitives form a pipeline.
+or overwrite. `LandingVersion` converts a validated `RecordMetadata` and an object receipt
+into one canonical Mongo document. Its deterministic `_id` includes the stable record and
+asset identities, metadata hash, exact byte hash and document format. `LandingMetadataStore`
+re-reads the object and checks its bucket, key, hash and length before inserting that
+document. A Mongo validator rejects incomplete or wrongly typed new documents, and a
+partial unique index prevents the same logical version from being inserted under another
+`_id`. Neither adapter exposes update/delete.
+
+Python calendar dates are stored as BSON datetimes at `00:00:00 UTC`; `datetime.date`
+objects are never passed directly to PyMongo. Inclusive source-date queries use
+`published_date >= start-at-UTC-midnight` and `< day-after-end-at-UTC-midnight`. The Mongo
+client returns timezone-aware UTC datetimes. This convention represents the source's
+displayed decision/determination date, not a publication instant.
 
 The gateway requires conditional object PUTs and rejects deletes, copies, multipart
 uploads, object-edit queries and competing preconditions. This restriction is needed
@@ -124,17 +136,23 @@ both buckets, and accepts object requests up to 32 MiB. Its limits are in
 Each adapter call holds one object's bytes in memory. This setup has one storage node,
 no replication and no automated backup or production scale validation.
 
-Mongo cannot atomically commit an S3 upload. A future ingestion operation must upload
-and verify bytes before inserting metadata. An object left behind by a failed metadata
-insert must be reused on retry, never deleted as rollback.
+Mongo cannot enforce that an S3 object exists and cannot atomically commit an S3 upload.
+The typed adapter enforces object-first ordering for application writes, but code that
+bypasses it and calls PyMongo directly also bypasses the cross-store check. A future
+ingestion operation must upload and verify bytes before inserting metadata. An object
+left behind by a failed metadata insert must be reused on retry, never deleted as rollback.
+The few synthetic documents written before the validator was introduced remain immutable;
+Mongo applies the validator to new writes without rewriting those preserved probes.
 
 ### Storage verification and safe stopping
 
 The opt-in tests use only small synthetic samples under `_checks/`, never the source
-website. They retain samples, including one new concurrency probe per run. They verify
-permission failures, duplicate prevention, exact-byte integrity, separate outputs,
-missing objects and an unavailable endpoint. Restart verification only reads existing
-data and compares the saved metadata/object snapshot, including hashes and timestamps.
+website. Their object keys and version identities are fixed, so reruns reuse existing
+samples instead of appending UUID probes. They verify schema and permission failures,
+logical duplicate prevention, BSON date ranges, exact-byte integrity, separate outputs,
+missing objects and an unavailable endpoint. Restart verification paginates through every
+synthetic document/object and compares the saved metadata/object snapshot, including
+hashes and timestamps.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest --storage -m "storage and not persistence" -p no:cacheprovider
@@ -143,10 +161,10 @@ docker compose --env-file .local/compose.env up -d --wait --wait-timeout 90
 .\.venv\Scripts\python.exe -m pytest --storage -m persistence -p no:cacheprovider
 ```
 
-Snapshot checks are capped at 100 synthetic documents/objects. For stronger persistence
-verification, `docker compose --env-file .local/compose.env up -d --force-recreate --wait`
-replaces the containers while retaining their named volumes; run the read-only
-persistence check afterward, before reseeding any test data.
+For stronger persistence verification,
+`docker compose --env-file .local/compose.env up -d --force-recreate --wait` replaces the
+containers while retaining their named volumes; run the read-only persistence check
+afterward, before running any test that can create its fixed sample for the first time.
 
 Stop without deleting data:
 
@@ -156,7 +174,10 @@ docker compose --env-file .local/compose.env stop
 
 Resume with `up -d --wait`. Never use `down -v`, delete/prune the project volumes, or
 delete `.local/` as a reset procedure. Mongo persists in `mongo_data`/`mongo_config`;
-SeaweedFS stores both raw bytes and its filer metadata in `seaweed_data`.
+SeaweedFS stores both raw bytes and its filer metadata in `seaweed_data`. If preparation
+is interrupted after `.local/credentials.json` exists, rerun `prepare`; it recreates only
+missing derived files from the same secrets. If the manifest itself is missing or corrupt,
+restore it from backup instead of rotating credentials or resetting storage.
 
 ## Validation
 

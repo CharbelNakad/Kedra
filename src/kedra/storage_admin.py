@@ -59,38 +59,41 @@ def local_settings(config: Path, role: str, directory: Path = LOCAL_DIRECTORY) -
         ) from None
 
 
-def prepare(config: Path, mongo_port: int, directory: Path = LOCAL_DIRECTORY) -> None:
-    public = _public_storage(config)
-    endpoint = urlsplit(public["s3_endpoint_url"])
-    if endpoint.scheme != "http" or endpoint.hostname not in ("localhost", "127.0.0.1"):
-        raise ValueError("Local Compose setup requires a loopback HTTP S3 endpoint")
-    if endpoint.path not in ("", "/") or endpoint.query or endpoint.fragment:
-        raise ValueError("Local S3 endpoint must not contain a path, query or fragment")
-    if not 1 <= mongo_port <= 65535:
-        raise ValueError("Mongo port must be between 1 and 65535")
-    if directory.exists():
-        local_settings(config, "admin", directory)
-        saved = json.loads((directory / "credentials.json").read_text(encoding="utf-8"))
-        if saved["mongo_port"] != mongo_port:
-            raise ValueError("Mongo port differs from the existing local provisioning")
-        for name in (
-            "mongo-root-password",
-            "s3.json",
-            "compose.env",
-            "ingest.env",
-            "transform.env",
-        ):
-            if not (directory / name).is_file():
-                raise ValueError(
-                    "Local provisioning is incomplete; recover files without rotating secrets"
-                )
-        return
-
+def _new_manifest(public: dict, mongo_port: int) -> dict:
     credentials = {}
-    identities = []
     database = quote(public["mongo_database"], safe="")
     root_password = secrets.token_urlsafe(32)
-    landing, transformed = public["landing_bucket"], public["transformed_bucket"]
+    for role in ("admin", "ingest", "transform"):
+        password = root_password if role == "admin" else secrets.token_urlsafe(32)
+        auth_database = "admin" if role == "admin" else database
+        credentials[role] = {
+            "mongo_uri": (
+                f"mongodb://kedra-{role}:{password}@127.0.0.1:{mongo_port}/"
+                f"?authSource={auth_database}"
+            ),
+            "s3_access_key_id": secrets.token_hex(12),
+            "s3_secret_access_key": secrets.token_urlsafe(32),
+        }
+    return {"storage": public, "mongo_port": mongo_port, "credentials": credentials}
+
+
+def _load_manifest(path: Path) -> dict:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise TypeError
+        return manifest
+    except (OSError, TypeError, json.JSONDecodeError):
+        raise ValueError(
+            "Local credential file is invalid; restore it without resetting data"
+        ) from None
+
+
+def _derived_files(manifest: dict) -> dict[str, str]:
+    public = manifest["storage"]
+    credentials = manifest["credentials"]
+    landing = public["landing_bucket"]
+    transformed = public["transformed_bucket"]
     actions = {
         "admin": ["Admin", "Read", "Write", "List", "Tagging"],
         "ingest": [f"Read:{landing}", f"List:{landing}", f"Write:{landing}"],
@@ -102,32 +105,31 @@ def prepare(config: Path, mongo_port: int, directory: Path = LOCAL_DIRECTORY) ->
             f"Write:{transformed}",
         ],
     }
+    identities = []
     for role in ("admin", "ingest", "transform"):
-        password = root_password if role == "admin" else secrets.token_urlsafe(32)
-        auth_database = "admin" if role == "admin" else database
-        access_key, secret_key = secrets.token_hex(12), secrets.token_urlsafe(32)
-        credentials[role] = {
-            "mongo_uri": f"mongodb://kedra-{role}:{password}@127.0.0.1:{mongo_port}/?authSource={auth_database}",
-            "s3_access_key_id": access_key,
-            "s3_secret_access_key": secret_key,
-        }
+        profile = credentials[role]
         identities.append(
             {
                 "name": f"kedra-{role}",
-                "credentials": [{"accessKey": access_key, "secretKey": secret_key}],
+                "credentials": [
+                    {
+                        "accessKey": profile["s3_access_key_id"],
+                        "secretKey": profile["s3_secret_access_key"],
+                    }
+                ],
                 "actions": actions[role],
             }
         )
-
-    # Refuse to replace any existing credentials. Losing them does not justify deleting volumes.
-    directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    endpoint = urlsplit(public["s3_endpoint_url"])
+    root_password = urlsplit(credentials["admin"]["mongo_uri"]).password
+    if not root_password:
+        raise ValueError("Local administrator credential is invalid")
     files = {
-        "credentials.json": json.dumps(
-            {"storage": public, "mongo_port": mongo_port, "credentials": credentials}, indent=2
-        ),
         "mongo-root-password": root_password,
         "s3.json": json.dumps({"identities": identities}, indent=2),
-        "compose.env": f"KEDRA_MONGO_PORT={mongo_port}\nKEDRA_S3_PORT={endpoint.port or 80}\n",
+        "compose.env": (
+            f"KEDRA_MONGO_PORT={manifest['mongo_port']}\nKEDRA_S3_PORT={endpoint.port or 80}\n"
+        ),
     }
     for role in ("ingest", "transform"):
         profile = credentials[role]
@@ -136,10 +138,72 @@ def prepare(config: Path, mongo_port: int, directory: Path = LOCAL_DIRECTORY) ->
             f"KEDRA_S3_ACCESS_KEY_ID={profile['s3_access_key_id']}\n"
             f"KEDRA_S3_SECRET_ACCESS_KEY={profile['s3_secret_access_key']}\n"
         )
-    for name, content in files.items():
-        descriptor = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
-            file.write(content)
+    return files
+
+
+def _write_or_validate(path: Path, content: str) -> None:
+    if path.exists():
+        if not path.is_file() or path.read_text(encoding="utf-8") != content:
+            raise ValueError(f"Existing local provisioning file {path.name} differs; restore it")
+        return
+    pending = path.with_name(path.name + ".pending")
+    if pending.exists():
+        if pending.is_file() and pending.read_text(encoding="utf-8") == content:
+            pending.rename(path)
+            return
+        if not pending.is_file():
+            raise ValueError(f"Local provisioning path {pending.name} must be a file")
+        # This is a derived temporary file; the credential manifest remains authoritative.
+        pending.unlink()
+    descriptor = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
+        file.write(content)
+        file.flush()
+        os.fsync(file.fileno())
+    pending.rename(path)
+
+
+def prepare(config: Path, mongo_port: int, directory: Path = LOCAL_DIRECTORY) -> None:
+    public = _public_storage(config)
+    endpoint = urlsplit(public["s3_endpoint_url"])
+    if endpoint.scheme != "http" or endpoint.hostname not in ("localhost", "127.0.0.1"):
+        raise ValueError("Local Compose setup requires a loopback HTTP S3 endpoint")
+    if endpoint.path not in ("", "/") or endpoint.query or endpoint.fragment:
+        raise ValueError("Local S3 endpoint must not contain a path, query or fragment")
+    if not 1 <= mongo_port <= 65535:
+        raise ValueError("Mongo port must be between 1 and 65535")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    manifest_path = directory / "credentials.json"
+    pending_path = directory / "credentials.json.pending"
+    if manifest_path.exists():
+        manifest = _load_manifest(manifest_path)
+    elif pending_path.exists():
+        manifest = _load_manifest(pending_path)
+        pending_path.rename(manifest_path)
+    elif any(directory.iterdir()):
+        raise ValueError(
+            "Local credential manifest is missing; restore it without rotating secrets"
+        )
+    else:
+        manifest = _new_manifest(public, mongo_port)
+        _write_or_validate(manifest_path, json.dumps(manifest, indent=2))
+
+    try:
+        if any(manifest["storage"][key] != public[key] for key in PROVISIONED_FIELDS):
+            raise ValueError(
+                "Storage config differs from local provisioning; do not reset data or secrets"
+            )
+        if manifest["mongo_port"] != mongo_port:
+            raise ValueError("Mongo port differs from the existing local provisioning")
+        for role in ("admin", "ingest", "transform"):
+            StorageSettings(**public, **manifest["credentials"][role])
+        derived = _derived_files(manifest)
+    except (KeyError, TypeError):
+        raise ValueError(
+            "Local credential file is invalid; restore it without resetting data"
+        ) from None
+    for name, content in derived.items():
+        _write_or_validate(directory / name, content)
 
 
 def landing_policy(bucket: str) -> dict:
@@ -177,6 +241,65 @@ def _permission_set(privileges: list[dict]) -> set[str]:
     }
 
 
+def landing_validator() -> dict:
+    """Require the canonical BSON shape for every new Landing metadata version."""
+    required = [
+        "_id",
+        "schema_version",
+        "record_key",
+        "asset_id",
+        "source",
+        "body_id",
+        "title",
+        "identifier",
+        "reference_number",
+        "description",
+        "published_date",
+        "source_date_raw",
+        "date_semantics",
+        "source_url",
+        "partition_date",
+        "partition_size",
+        "metadata_hash",
+        "object_bucket",
+        "object_key",
+        "file_hash",
+        "size_bytes",
+        "document_format",
+    ]
+    sha256 = "^[0-9a-f]{64}$"
+    return {
+        "$jsonSchema": {
+            "bsonType": "object",
+            "required": required,
+            "properties": {
+                "_id": {"bsonType": "string", "pattern": sha256},
+                "schema_version": {"enum": [1]},
+                "record_key": {"bsonType": "string", "pattern": sha256},
+                "asset_id": {"bsonType": "string", "minLength": 1},
+                "source": {"bsonType": "string", "minLength": 1},
+                "body_id": {"bsonType": "string", "minLength": 1},
+                "title": {"bsonType": "string", "minLength": 1},
+                "identifier": {"bsonType": "string", "minLength": 1},
+                "reference_number": {"bsonType": ["string", "null"]},
+                "description": {"bsonType": ["string", "null"]},
+                "published_date": {"bsonType": "date"},
+                "source_date_raw": {"bsonType": "string", "minLength": 1},
+                "date_semantics": {"enum": ["decision_or_determination_date"]},
+                "source_url": {"bsonType": "string", "minLength": 1},
+                "partition_date": {"bsonType": "date"},
+                "partition_size": {"enum": ["month", "day"]},
+                "metadata_hash": {"bsonType": "string", "pattern": sha256},
+                "object_bucket": {"bsonType": "string", "minLength": 1},
+                "object_key": {"bsonType": "string", "minLength": 1},
+                "file_hash": {"bsonType": "string", "pattern": sha256},
+                "size_bytes": {"bsonType": ["int", "long"], "minimum": 0},
+                "document_format": {"enum": ["html", "pdf", "doc", "docx"]},
+            },
+        }
+    }
+
+
 def bootstrap(config: Path, directory: Path = LOCAL_DIRECTORY) -> None:
     admin = local_settings(config, "admin", directory)
     with mongo_client(admin) as client:
@@ -189,11 +312,41 @@ def bootstrap(config: Path, directory: Path = LOCAL_DIRECTORY) -> None:
             admin.state_collection,
         ):
             if name not in existing:
-                db.create_collection(name)
+                options = (
+                    {
+                        "validator": landing_validator(),
+                        "validationLevel": "strict",
+                        "validationAction": "error",
+                    }
+                    if name == admin.landing_collection
+                    else {}
+                )
+                db.create_collection(name, **options)
+        # collMod applies validation to future writes without rewriting preserved records.
+        db.command(
+            "collMod",
+            admin.landing_collection,
+            validator=landing_validator(),
+            validationLevel="strict",
+            validationAction="error",
+        )
         for name in (admin.landing_collection, admin.transformed_collection):
             db[name].create_index(
                 [("published_date", 1), ("_id", 1)], name="published_date_version"
             )
+        logical_fields = [
+            ("record_key", 1),
+            ("asset_id", 1),
+            ("metadata_hash", 1),
+            ("file_hash", 1),
+            ("document_format", 1),
+        ]
+        db[admin.landing_collection].create_index(
+            logical_fields,
+            name="logical_landing_version",
+            unique=True,
+            partialFilterExpression={field: {"$type": "string"} for field, _ in logical_fields},
+        )
         privileges = {
             "ingest": [
                 {

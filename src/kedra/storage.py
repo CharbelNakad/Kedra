@@ -1,9 +1,9 @@
-"""Small create-only storage adapters; no source requests or document parsing."""
+"""Create-only storage adapters for immutable source objects and metadata."""
 
 import base64
 import hashlib
-from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import boto3
@@ -13,6 +13,10 @@ from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from kedra.config import StorageSettings
+from kedra.identity import canonical_url, stable_hash
+from kedra.models import RecordMetadata
+
+DOCUMENT_FORMATS = frozenset({"html", "pdf", "doc", "docx"})
 
 
 class StorageError(RuntimeError):
@@ -34,6 +38,8 @@ def mongo_client(settings: StorageSettings) -> MongoClient:
         connectTimeoutMS=settings.connect_timeout_seconds * 1000,
         socketTimeoutMS=settings.read_timeout_seconds * 1000,
         retryWrites=False,
+        tz_aware=True,
+        tzinfo=UTC,
     )
 
 
@@ -54,6 +60,29 @@ def s3_client(settings: StorageSettings):
     )
 
 
+def mongo_date(value: date) -> datetime:
+    """Represent a source calendar date as UTC midnight in BSON."""
+    if type(value) is not date:
+        raise ValueError("Mongo date values must be calendar dates")
+    return datetime(value.year, value.month, value.day, tzinfo=UTC)
+
+
+def published_date_filter(start_date: date, end_date: date) -> dict[str, dict[str, datetime]]:
+    """Build an inclusive calendar-date filter using a half-open BSON range."""
+    if type(start_date) is not date or type(end_date) is not date:
+        raise ValueError("Date bounds must be calendar dates")
+    if start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+    if end_date == date.max:
+        raise ValueError("end_date is too large for an exclusive upper bound")
+    return {
+        "published_date": {
+            "$gte": mongo_date(start_date),
+            "$lt": mongo_date(end_date + timedelta(days=1)),
+        }
+    }
+
+
 @dataclass(frozen=True)
 class StoredObject:
     bucket: str
@@ -61,6 +90,80 @@ class StoredObject:
     file_hash: str
     size_bytes: int
     created: bool
+
+
+@dataclass(frozen=True)
+class LandingVersion:
+    """Canonical metadata for one source record, asset and exact byte version."""
+
+    record: RecordMetadata
+    asset_id: str
+    document_format: str
+    stored_object: StoredObject
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, RecordMetadata):
+            raise ValueError("record must be RecordMetadata")
+        if not isinstance(self.asset_id, str) or not self.asset_id.strip():
+            raise ValueError("asset_id must be a nonblank string")
+        if self.document_format not in DOCUMENT_FORMATS:
+            raise ValueError("document_format must be html, pdf, doc or docx")
+        stored = self.stored_object
+        if not isinstance(stored, StoredObject):
+            raise ValueError("stored_object must be StoredObject")
+        if not isinstance(stored.bucket, str) or not stored.bucket.strip():
+            raise ValueError("Stored object bucket must be a nonblank string")
+        if not isinstance(stored.key, str) or not stored.key.strip():
+            raise ValueError("Stored object key must be a nonblank string")
+        if (
+            not isinstance(stored.file_hash, str)
+            or len(stored.file_hash) != 64
+            or any(character not in "0123456789abcdef" for character in stored.file_hash)
+        ):
+            raise ValueError("Stored object hash must be a lowercase SHA-256")
+        if type(stored.size_bytes) is not int or stored.size_bytes < 0:
+            raise ValueError("Stored object size must be a nonnegative integer")
+
+    @property
+    def version_id(self) -> str:
+        return stable_hash(
+            {
+                "record_key": self.record.record_key,
+                "asset_id": self.asset_id.strip(),
+                "metadata_hash": self.record.metadata_hash,
+                "file_hash": self.stored_object.file_hash,
+                "document_format": self.document_format,
+            }
+        )
+
+    def to_document(self) -> dict[str, Any]:
+        """Serialize domain dates to BSON-compatible UTC datetimes."""
+        record = self.record
+        stored = self.stored_object
+        return {
+            "_id": self.version_id,
+            "schema_version": 1,
+            "record_key": record.record_key,
+            "asset_id": self.asset_id.strip(),
+            "source": record.source,
+            "body_id": record.body_id,
+            "title": record.title,
+            "identifier": record.identifier,
+            "reference_number": record.reference_number,
+            "description": record.description,
+            "published_date": mongo_date(record.published_date),
+            "source_date_raw": record.source_date_raw,
+            "date_semantics": record.date_semantics,
+            "source_url": canonical_url(record.source_url),
+            "partition_date": mongo_date(record.partition_date),
+            "partition_size": record.partition_size,
+            "metadata_hash": record.metadata_hash,
+            "object_bucket": stored.bucket,
+            "object_key": stored.key,
+            "file_hash": stored.file_hash,
+            "size_bytes": stored.size_bytes,
+            "document_format": self.document_format,
+        }
 
 
 class ObjectStore:
@@ -98,6 +201,25 @@ class ObjectStore:
             raise IntegrityError("Stored bytes do not match the expected SHA-256")
         return data
 
+    def verify(self, stored: StoredObject) -> None:
+        """Prove that an immutable-object receipt still describes the stored bytes."""
+        if not isinstance(stored, StoredObject):
+            raise ValueError("stored must be StoredObject")
+        if stored.bucket != self._bucket:
+            raise IntegrityError("Stored object belongs to a different bucket")
+        self._check_key(stored.key)
+        if (
+            not isinstance(stored.file_hash, str)
+            or len(stored.file_hash) != 64
+            or any(character not in "0123456789abcdef" for character in stored.file_hash)
+        ):
+            raise ValueError("Stored object hash must be a lowercase SHA-256")
+        if type(stored.size_bytes) is not int or stored.size_bytes < 0:
+            raise ValueError("Stored object size must be a nonnegative integer")
+        data = self.read(stored.key, stored.file_hash)
+        if len(data) != stored.size_bytes:
+            raise IntegrityError("Stored bytes do not match the expected size")
+
     def put_if_absent(self, key: str, data: bytes) -> StoredObject:
         self._check_key(key)
         if not isinstance(data, bytes):
@@ -123,27 +245,50 @@ class ObjectStore:
         return StoredObject(self._bucket, key, digest.hexdigest(), len(data), created)
 
 
-class MetadataStore:
-    """Insert immutable version documents under Mongo's unique _id; expose no mutation API."""
+class LandingMetadataStore:
+    """Append typed Landing versions only after their exact object has been verified."""
 
-    def __init__(self, collection):
+    def __init__(self, collection, object_store: ObjectStore):
         self._collection = collection
+        self._object_store = object_store
 
     def find(self, version_id: str) -> dict[str, Any] | None:
+        if not isinstance(version_id, str) or not version_id.strip():
+            raise ValueError("version_id must be a nonblank string")
         try:
             return self._collection.find_one({"_id": version_id})
         except PyMongoError:
             raise StorageError("Metadata read failed") from None
 
-    def insert_if_absent(self, document: Mapping[str, Any]) -> bool:
-        version_id = document.get("_id")
-        if not isinstance(version_id, str) or not version_id.strip():
-            raise ValueError("Metadata requires a nonblank string _id identifying its version")
+    def find_published_between(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        query = published_date_filter(start_date, end_date)
         try:
-            self._collection.insert_one(dict(document))
+            return list(self._collection.find(query).sort([("published_date", 1), ("_id", 1)]))
+        except PyMongoError:
+            raise StorageError("Metadata date query failed") from None
+
+    def insert_if_absent(self, version: LandingVersion) -> bool:
+        if not isinstance(version, LandingVersion):
+            raise ValueError("Landing metadata requires a LandingVersion")
+        self._object_store.verify(version.stored_object)
+        document = version.to_document()
+        try:
+            self._collection.insert_one(document)
             return True
         except DuplicateKeyError:
-            if self.find(version_id) != document:
+            existing = self.find(version.version_id)
+            # A valid daily and monthly run describe the same source version. Keep the
+            # first immutable partition label rather than creating a processing-context copy.
+            ignored = {"partition_date", "partition_size"}
+            comparable_existing = (
+                {key: value for key, value in existing.items() if key not in ignored}
+                if existing is not None
+                else None
+            )
+            comparable_document = {
+                key: value for key, value in document.items() if key not in ignored
+            }
+            if comparable_existing != comparable_document:
                 raise IntegrityError(
                     "Existing metadata version differs; it cannot be replaced"
                 ) from None
