@@ -10,6 +10,7 @@ download_delay_seconds = 2.0
 concurrency_per_domain = 1
 timeout_seconds = 25.0
 retry_times = 3
+rate_limit_backoff_max_seconds = 300.0
 max_response_bytes = 20971520
 max_pages_per_partition = 1000 # fail visibly instead of following an unbounded pager
 

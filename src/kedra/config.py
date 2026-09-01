@@ -47,16 +47,25 @@ class ScrapingSettings:
     concurrency_per_domain: int
     timeout_seconds: float
     retry_times: int
+    rate_limit_backoff_max_seconds: float
     max_response_bytes: int
     max_pages_per_partition: int
 
     def __post_init__(self) -> None:
         if self.partition_size not in ("month", "day"):
             raise ValueError("scraping.partition_size must be month or day")
-        for name in ("download_delay_seconds", "timeout_seconds"):
+        for name in (
+            "download_delay_seconds",
+            "timeout_seconds",
+            "rate_limit_backoff_max_seconds",
+        ):
             value = getattr(self, name)
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"scraping.{name} must be a finite positive number")
+        if self.rate_limit_backoff_max_seconds < self.download_delay_seconds:
+            raise ValueError(
+                "scraping.rate_limit_backoff_max_seconds must be at least download_delay_seconds"
+            )
         for name in (
             "concurrency_per_domain",
             "retry_times",

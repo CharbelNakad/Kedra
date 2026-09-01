@@ -64,20 +64,29 @@ run; repeat the option to select more than one configured body.
 The command still validates the complete configuration, so the three storage environment
 variables shown above must be present, although discovery does not connect to storage.
 Every output line is a JSON object with a run ID and UTC timestamp. It records scheduled
-partitions, parsed pages, discovered metadata, card/listing failures, reconciled partition
-counts and a final run summary. Exit code 0 means every selected body/partition was fully
-enumerated; 2 means invalid input/configuration; 3 means discovery was incomplete.
+partitions, parsed pages, discovered metadata, card/listing failures, identity collisions,
+reconciled partition counts and a final run summary. The final summary separates advertised
+totals, card occurrences, parsed/malformed cards, distinct records, duplicates, failed page
+URLs and known missing records. Document, download and storage totals are explicitly marked
+as not run because discovery does not perform those stages. Exit code 0 means every selected
+body/partition was fully enumerated; 2 means invalid input/configuration; 3 means discovery
+was incomplete.
 
 Cards use the verified `li.each-item`, `h2.title`, `p.description`, `span.date`, `.refNO`
-and `.link a` selectors. A missing description becomes `null`. An empty response or a page
-without cards and an explicit no-results message is a failure, never a zero-result success.
-The tracker rejects changed filters, skipped/repeated pages, changing totals, duplicate or
-malformed cards, count mismatches and a configured page safety limit.
+and `.link a` selectors. A missing description becomes `null`. Zero results require both the
+known no-results region and a trusted zero count; an arbitrary phrase elsewhere in the page
+cannot establish a complete empty partition. The tracker rejects changed filters,
+skipped/repeated pages, changing totals, malformed cards, identity collisions, count
+mismatches and a configured page safety limit. Exact duplicate cards are counted separately
+from conflicting cards that share a logical record key.
 
-Scrapy obeys `robots.txt`, disables cookies, uses the configured per-domain concurrency,
-delay, timeout, retry count, response-size limit and retryable status codes including 429.
-The default page safety limit is 1,000 pages per body/partition; reaching it fails the
-partition rather than reporting truncated success. Tune these values in TOML, not source.
+Scrapy obeys `robots.txt`, disables cookies, uses AutoThrottle plus the configured per-domain
+concurrency, delay, timeout, retry count and response-size limit. A 429 response creates a
+shared cooldown for that origin: a valid `Retry-After` controls the delay, while a missing or
+invalid header uses randomized exponential backoff capped by
+`rate_limit_backoff_max_seconds`. Waiting is asynchronous, so it does not block Scrapy's
+reactor. The default page safety limit is 1,000 pages per body/partition; reaching it fails
+the partition rather than reporting truncated success. Tune these values in TOML, not source.
 
 The bounded 2026-09-01 recheck of the previously known 17 July 2025 WRC result returned
 HTTP 200 with an empty body. The command correctly reported `empty_listing_response` and

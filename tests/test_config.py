@@ -39,6 +39,10 @@ def test_missing_or_blank_required_secrets_are_rejected(example_env, env_name, v
         ("timeout_seconds = 25.0", "timeout_seconds = inf"),
         ("concurrency_per_domain = 1", "concurrency_per_domain = true"),
         ("retry_times = 3", "retry_times = -1"),
+        (
+            "rate_limit_backoff_max_seconds = 300.0",
+            "rate_limit_backoff_max_seconds = 1.0",
+        ),
         ("max_response_bytes = 20971520", "max_response_bytes = 0"),
         ("max_pages_per_partition = 1000", "max_pages_per_partition = 0"),
         ('body_ids = ["2", "1", "3", "15376"]', "body_ids = []"),
