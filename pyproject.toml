@@ -28,6 +28,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "storage: requires explicitly provisioned local Docker storage",
+    "persistence: read-only verification of samples written before a container restart",
+]
 
 [tool.ruff]
 target-version = "py312"

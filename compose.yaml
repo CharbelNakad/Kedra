@@ -1,0 +1,81 @@
+name: kedra
+
+services:
+  mongo:
+    image: mongo:8.0@sha256:02a0cc7939f5ed38f30f9bc714ef5f682d49baf9350c54acf302ce833087fe8a
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: kedra-admin
+      MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/mongo_root_password
+    secrets:
+      - mongo_root_password
+    ports:
+      - "127.0.0.1:${KEDRA_MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo_data:/data/db
+      - mongo_config:/data/configdb
+    healthcheck:
+      test: [CMD, mongosh, --quiet, --eval, "quit(db.adminCommand('ping').ok ? 0 : 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [local]
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.44@sha256:e67e8c385484120b78bff47ba5f4debbca47fbd27ed1a39f016f47e8baea615b
+    command:
+      - server
+      - -dir=/data
+      - -ip=127.0.0.1
+      - -ip.bind=0.0.0.0
+      - -volume.max=${KEDRA_SEAWEED_VOLUME_MAX:-0}
+      - -master.volumeSizeLimitMB=${KEDRA_SEAWEED_VOLUME_SIZE_MB:-128}
+      - -master.telemetry=false
+      - -filer
+      - -s3
+      - -s3.allowDeleteBucketNotEmpty=false
+      - -s3.config=/run/secrets/s3_identities
+    secrets:
+      - s3_identities
+    volumes:
+      - seaweed_data:/data
+      - ./infra/filer.toml:/etc/seaweedfs/filer.toml:ro
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:9333/cluster/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [storage]
+
+  s3:
+    image: nginx:stable-alpine@sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${KEDRA_S3_PORT:-8333}:8333"
+    volumes:
+      - ./infra/s3-gateway.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:8333/_healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [local, storage]
+
+secrets:
+  mongo_root_password:
+    file: ./.local/mongo-root-password
+  s3_identities:
+    file: ./.local/s3.json
+
+volumes:
+  mongo_data:
+  mongo_config:
+  seaweed_data:
+
+networks:
+  local:
+  storage:
+    internal: true

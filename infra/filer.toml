@@ -1,0 +1,4 @@
+# Keep file metadata in the same persistent volume as the object bytes.
+[leveldb2]
+enabled = true
+dir = "/data/filer"

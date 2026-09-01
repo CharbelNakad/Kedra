@@ -22,6 +22,9 @@ s3_region = "us-east-1"
 landing_bucket = "kedra-landing"
 transformed_bucket = "kedra-transformed"
 object_prefix = "workplace-relations"
+connect_timeout_seconds = 5
+read_timeout_seconds = 30
+max_attempts = 3
 
 # Required only in the environment, never committed:
 # KEDRA_MONGO_URI, KEDRA_S3_ACCESS_KEY_ID, KEDRA_S3_SECRET_ACCESS_KEY

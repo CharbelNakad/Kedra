@@ -7,7 +7,10 @@ from dns.resolver import Resolver
 
 
 @pytest.fixture(autouse=True)
-def no_network(monkeypatch):
+def no_network(monkeypatch, request):
+    if request.node.get_closest_marker("storage") and request.config.getoption("--storage"):
+        return
+
     def reject(*args, **kwargs):
         raise AssertionError("Unit tests must not access the network")
 
@@ -17,6 +20,19 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect_ex", reject)
     monkeypatch.setattr(socket.socket, "sendto", reject)
     monkeypatch.setattr(Resolver, "resolve", reject)
+
+
+def pytest_addoption(parser):
+    parser.addoption("--storage", action="store_true", help="Enable explicit local storage checks")
+
+
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--storage"):
+        for item in items:
+            if item.get_closest_marker("storage"):
+                item.add_marker(
+                    pytest.mark.skip(reason="Use --storage for local Docker integration checks")
+                )
 
 
 @pytest.fixture

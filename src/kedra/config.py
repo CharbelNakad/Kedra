@@ -77,10 +77,17 @@ class StorageSettings:
     mongo_uri: str = field(repr=False)
     s3_access_key_id: str = field(repr=False)
     s3_secret_access_key: str = field(repr=False)
+    connect_timeout_seconds: int = 5
+    read_timeout_seconds: int = 30
+    max_attempts: int = 3
 
     def __post_init__(self) -> None:
-        for name in self.__dataclass_fields__:
+        numeric_fields = ("connect_timeout_seconds", "read_timeout_seconds", "max_attempts")
+        for name in self.__dataclass_fields__.keys() - set(numeric_fields):
             _text(getattr(self, name), f"storage.{name}")
+        for name in numeric_fields:
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"storage.{name} must be a positive integer")
         try:
             if not self.mongo_uri.startswith(("mongodb://", "mongodb+srv://")):
                 raise ValueError

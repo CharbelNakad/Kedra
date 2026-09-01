@@ -1,11 +1,11 @@
 # Kedra
 
-Python utilities for the Workplace Relations coding test: offline configuration
-validation, calendar date partitioning, stable document identity and metadata models.
+Python utilities for the Workplace Relations coding test: configuration validation,
+calendar partitions, stable document identity and persistent local storage primitives.
 
-The available command validates configuration and previews date partitions without
-network access. Crawling, persistent storage, document transformation and orchestration
-are not implemented.
+The application command previews configuration and partitions offline. Separate
+administration commands provision local storage. Crawling, document ingestion,
+transformation and orchestration are not implemented.
 
 ## Setup (PowerShell)
 
@@ -47,6 +47,117 @@ deferring SRV DNS lookups as well as connections. Driver warnings about URI opti
 are treated as errors without echoing their values. Passing this check does not prove
 DNS records, authentication, permissions or service availability.
 
+## Local storage (PowerShell)
+
+Use Docker Desktop with Linux containers. The storage deployment consists of MongoDB
+8.0.29, SeaweedFS 4.44 and an Nginx 1.30.4 S3 gateway; all images are pinned by digest.
+Only MongoDB and the gateway publish ports, both bound to `127.0.0.1`.
+SeaweedFS's S3, filer and management interfaces stay on a private Docker network.
+
+```powershell
+docker desktop start
+.\.venv\Scripts\python.exe -m kedra.storage_admin prepare --config config.example.toml
+docker compose --env-file .local/compose.env config --quiet
+docker compose --env-file .local/compose.env up -d --wait --wait-timeout 90
+.\.venv\Scripts\python.exe -m kedra.storage_admin bootstrap --config config.example.toml
+```
+
+`prepare` generates random administrator, ingestion and transformation credentials in
+ignored `.local/` files. It never replaces existing credentials. `bootstrap` creates
+separate buckets/collections, date indexes, restricted Mongo roles and a Landing bucket
+policy. Repeating these commands preserves existing data and checks role/policy drift.
+The container health checks cover basic process/HTTP readiness; the tests below verify
+authenticated storage operations.
+
+| Role | Landing | Other access |
+| --- | --- | --- |
+| Ingestion | Read and append metadata/objects | Read/write operational checkpoints in `crawl_state` |
+| Transformation | Read metadata/objects | Append to the separate transformed collection/bucket |
+| Administrator | Provisioning access | Local setup only; never use these credentials for ingestion/transformation |
+
+To customize names or the S3 port, prepare with a modified `config.local.toml` before
+first provisioning. Use `--mongo-port` for a different Mongo port. Pass the same config
+path to later administration commands. Storage timeouts, retry attempts and object
+prefix can change without reprovisioning. Changing provisioned resource names/endpoints
+is deliberately rejected rather than silently replacing credentials or data.
+Integration tests use `config.example.toml` and the generated local profiles.
+
+The application still reads credentials from its environment. To explicitly load the
+restricted ingestion profile into the current PowerShell process:
+
+```powershell
+Get-Content .local/ingest.env | ForEach-Object {
+    $name, $value = $_ -split '=', 2
+    [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+}
+```
+
+Use `transform.env` for transformation credentials. `.local/credentials.json` also
+contains administrator credentials: keep this directory private, back it up securely
+and never commit it. Files use owner-only creation modes on POSIX; Windows access
+depends on the workspace's inherited ACLs. Docker secrets here are local file mounts,
+not an encrypted secret vault.
+
+### Immutable storage and its limits
+
+`ObjectStore.put_if_absent` uses `If-None-Match: *`, then reads and hashes the exact stored
+bytes. Existing identical bytes are reused; a conflicting object fails without repair
+or overwrite. `MetadataStore.insert_if_absent` uses Mongo's unique `_id`, reuses identical
+documents and rejects conflicting documents. Neither adapter exposes update/delete.
+Callers supply version IDs and object keys; document ingestion and asset-version
+construction are still required before these primitives form a pipeline.
+
+The gateway requires conditional object PUTs and rejects deletes, copies, multipart
+uploads, object-edit queries and competing preconditions. This restriction is needed
+because [SeaweedFS 4.44's policy request extraction](https://github.com/seaweedfs/seaweedfs/blob/4.44/weed/s3api/policy_engine/engine.go)
+does not expose `s3:if-none-match`, despite supporting conditional writes. The backend
+is not published directly. Mongo permissions independently forbid Landing updates and
+deletes, and transformation credentials cannot append to Landing.
+
+This is a local application permission boundary, not protection against a Docker/host
+administrator who can read secrets, bypass the gateway or edit volume files. The S3
+gateway intentionally supports a small API subset, applies create-only behavior to
+both buckets, and accepts object requests up to 32 MiB. Its limits are in
+`infra/s3-gateway.conf`. SeaweedFS volume count/size are configurable through
+`KEDRA_SEAWEED_VOLUME_MAX` (default `0`, automatic) and
+`KEDRA_SEAWEED_VOLUME_SIZE_MB` (default `128`) in the Compose environment.
+Each adapter call holds one object's bytes in memory. This setup has one storage node,
+no replication and no automated backup or production scale validation.
+
+Mongo cannot atomically commit an S3 upload. A future ingestion operation must upload
+and verify bytes before inserting metadata. An object left behind by a failed metadata
+insert must be reused on retry, never deleted as rollback.
+
+### Storage verification and safe stopping
+
+The opt-in tests use only small synthetic samples under `_checks/`, never the source
+website. They retain samples, including one new concurrency probe per run. They verify
+permission failures, duplicate prevention, exact-byte integrity, separate outputs,
+missing objects and an unavailable endpoint. Restart verification only reads existing
+data and compares the saved metadata/object snapshot, including hashes and timestamps.
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest --storage -m "storage and not persistence" -p no:cacheprovider
+docker compose --env-file .local/compose.env restart
+docker compose --env-file .local/compose.env up -d --wait --wait-timeout 90
+.\.venv\Scripts\python.exe -m pytest --storage -m persistence -p no:cacheprovider
+```
+
+Snapshot checks are capped at 100 synthetic documents/objects. For stronger persistence
+verification, `docker compose --env-file .local/compose.env up -d --force-recreate --wait`
+replaces the containers while retaining their named volumes; run the read-only
+persistence check afterward, before reseeding any test data.
+
+Stop without deleting data:
+
+```powershell
+docker compose --env-file .local/compose.env stop
+```
+
+Resume with `up -d --wait`. Never use `down -v`, delete/prune the project volumes, or
+delete `.local/` as a reset procedure. Mongo persists in `mongo_data`/`mongo_config`;
+SeaweedFS stores both raw bytes and its filer metadata in `seaweed_data`.
+
 ## Validation
 
 ```powershell
@@ -57,9 +168,10 @@ uv pip check --python .venv/Scripts/python.exe --cache-dir .uv-cache
 .\.venv\Scripts\ruff.exe format --check .
 ```
 
-Tests use synthetic inputs and no external services. Dependency resolution and import
-checks cover Scrapy, pymongo, boto3, BeautifulSoup and Dagster; they do not verify service
-connectivity, persistence or live scraping behavior.
+Default tests use synthetic inputs with DNS/socket access blocked; storage integration
+tests are skipped unless `--storage` is supplied. Dependency/import checks do not prove
+service behavior. The opt-in checks above exercise local storage only; no tests yet
+prove live scraping or the complete ingestion/transformation pipeline.
 
 ## Design decisions and constraints
 
@@ -75,7 +187,7 @@ connectivity, persistence or live scraping behavior.
   decision/determination date. It is not an inferred true publication timestamp.
 - Encode unsafe filename characters reversibly, preserving the original identifier.
   Storage paths are intended to separate source/body/record/asset versions into parent
-  directories; no file storage is implemented.
+  directories; source-specific asset paths will be constructed during ingestion.
 
 ## Freshness limitations
 
