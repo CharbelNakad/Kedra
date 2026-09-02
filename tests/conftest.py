@@ -22,8 +22,25 @@ def no_network(monkeypatch, request):
 
     monkeypatch.setattr(socket, "create_connection", reject)
     monkeypatch.setattr(socket, "getaddrinfo", reject)
-    monkeypatch.setattr(socket.socket, "connect", reject)
-    monkeypatch.setattr(socket.socket, "connect_ex", reject)
+    if request.node.get_closest_marker("local_runtime"):
+        original_connect = socket.socket.connect
+        original_connect_ex = socket.socket.connect_ex
+
+        def connect_loopback_only(instance, address):
+            if isinstance(address, tuple) and address[0] in ("127.0.0.1", "::1"):
+                return original_connect(instance, address)
+            return reject(instance, address)
+
+        def connect_ex_loopback_only(instance, address):
+            if isinstance(address, tuple) and address[0] in ("127.0.0.1", "::1"):
+                return original_connect_ex(instance, address)
+            return reject(instance, address)
+
+        monkeypatch.setattr(socket.socket, "connect", connect_loopback_only)
+        monkeypatch.setattr(socket.socket, "connect_ex", connect_ex_loopback_only)
+    else:
+        monkeypatch.setattr(socket.socket, "connect", reject)
+        monkeypatch.setattr(socket.socket, "connect_ex", reject)
     monkeypatch.setattr(socket.socket, "sendto", reject)
     monkeypatch.setattr(Resolver, "resolve", reject)
 

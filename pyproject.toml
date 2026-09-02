@@ -33,6 +33,7 @@ markers = [
     "persistence: read-only verification of samples written before a container restart",
     "live_discovery: makes a bounded request to the configured public search source",
     "local_http: uses a loopback-only controlled HTTP server",
+    "local_runtime: permits loopback sockets required by a local framework runtime",
 ]
 
 [tool.ruff]

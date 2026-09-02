@@ -12,6 +12,8 @@ import pytest
 
 from kedra.ingestion import validator_state_id
 from kedra.models import RecordMetadata
+from kedra.storage import mongo_client
+from kedra.storage_admin import local_settings
 
 pytestmark = [pytest.mark.storage, pytest.mark.local_http]
 
@@ -140,6 +142,15 @@ def object_key_snapshot(s3, settings):
     return sorted(item["Key"] for page in pages for item in page.get("Contents", []))
 
 
+def transformed_snapshot():
+    settings = local_settings(ROOT / "config.example.toml", "transform")
+    with mongo_client(settings) as mongo:
+        documents = mongo[settings.mongo_database][settings.transformed_collection].find(
+            {"record_key": RECORD.record_key}
+        )
+        return sorted(documents, key=lambda document: document["_id"])
+
+
 def run_ingestion(config, settings):
     environment = os.environ.copy()
     environment.update(
@@ -176,6 +187,52 @@ def run_ingestion(config, settings):
     )
     events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     summary = next(event for event in reversed(events) if event["event"] == "ingestion_run_summary")
+    return result, summary
+
+
+def run_orchestration(config, run_directory):
+    environment = os.environ.copy()
+    for name in (
+        "KEDRA_MONGO_URI",
+        "KEDRA_S3_ACCESS_KEY_ID",
+        "KEDRA_S3_SECRET_ACCESS_KEY",
+    ):
+        environment.pop(name, None)
+    environment["PYTHONUTF8"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "kedra",
+            "orchestrate",
+            "--config",
+            str(config),
+            "--start-date",
+            "2025-07-17",
+            "--end-date",
+            "2025-07-17",
+            "--body-id",
+            "2",
+            "--ingest-env",
+            str(ROOT / ".local" / "ingest.env"),
+            "--transform-env",
+            str(ROOT / ".local" / "transform.env"),
+            "--run-directory",
+            str(run_directory),
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=90,
+        check=False,
+    )
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    summary = next(
+        event for event in reversed(events) if event["event"] == "orchestration_run_summary"
+    )
     return result, summary
 
 
@@ -228,3 +285,64 @@ def test_two_complete_cli_processes_reuse_one_verified_document_body(tmp_path, s
     assert second_summary["downloaded_files"] == 0
     assert second_summary["not_modified_files"] == 1
     assert second_summary["records_reused_without_download"] == 1
+
+
+def test_dagster_cli_runs_both_stages_and_reruns_without_new_versions(tmp_path, stores):
+    settings, database, s3, _, _ = stores
+    config = tmp_path / "orchestration.toml"
+    run_directory = tmp_path / "runs"
+    write_config(config, settings)
+    state_id = validator_state_id(RECORD.record_key, DOCUMENT_URL)
+    database[settings.state_collection].delete_one({"_id": state_id})
+    RerunHandler.reset()
+    server = ThreadingHTTPServer((HOST, PORT), RerunHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        first, first_summary = run_orchestration(config, run_directory)
+        first_landing = metadata_snapshot(database, settings)
+        first_transformed = transformed_snapshot()
+        second, second_summary = run_orchestration(config, run_directory)
+        second_landing = metadata_snapshot(database, settings)
+        second_transformed = transformed_snapshot()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert first_summary["complete"] is True
+    assert second_summary["complete"] is True
+    assert first_summary["run_id"] != second_summary["run_id"]
+    assert RerunHandler.document_validators == [None, ETAG]
+    assert RerunHandler.document_body_responses == 1
+    assert first_landing
+    assert first_transformed
+    assert second_landing == first_landing
+    assert second_transformed == first_transformed
+
+    manifests = []
+    transformation_logs = []
+    for summary in (first_summary, second_summary):
+        manifest_path = Path(summary["ingestion_manifest_path"])
+        transformation_log_path = Path(summary["transformation_log_path"])
+        manifests.append(manifest_path)
+        transformation_logs.append(transformation_log_path)
+        assert manifest_path.is_file()
+        assert transformation_log_path.is_file()
+        manifest_events = [
+            json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()
+        ]
+        transformation_events = [
+            json.loads(line)
+            for line in transformation_log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert manifest_events[-1]["event"] == "ingestion_run_summary"
+        assert manifest_events[-1]["complete"] is True
+        assert transformation_events[-1]["event"] == "transformation_run_summary"
+        assert transformation_events[-1]["complete"] is True
+        assert transformation_events[-1]["ingestion_run_id"] == manifest_events[-1]["run_id"]
+    assert manifests[0] != manifests[1]
+    assert transformation_logs[0] != transformation_logs[1]

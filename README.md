@@ -5,9 +5,9 @@ calendar partitions, filtered result discovery, immutable decision-asset ingesti
 stable document identity, persistent local storage and deterministic transformation.
 
 The application can preview configuration offline, enumerate filtered result cards, or use
-Scrapy to download explicit decision assets into the Landing Zone. A standalone command
-transforms stored assets into separate output storage. Separate administration commands
-provision local storage; orchestration is not implemented.
+Scrapy to download explicit decision assets into the Landing Zone. Transformation remains
+independently runnable, and a local Dagster job connects ingestion to transformation through
+a completed-run manifest. Separate administration commands provision local storage.
 
 ## Setup (PowerShell)
 
@@ -284,6 +284,39 @@ identifier. A future source-layout change will fail for review rather than silen
 incomplete legal text. Wrapper output preserves source-link provenance; it does not rewrite
 links to transformed object URLs.
 
+## Orchestrated ingestion and transformation (PowerShell)
+
+The `orchestrate` command runs the existing ingestion and transformation functions as two
+Dagster ops. The output of the first op is the completed ingestion manifest path, which is
+the input of the second op. Dagster therefore skips transformation if ingestion returns an
+incomplete result or does not finish. The transformation op applies the same manifest
+validation as the standalone `transform` command.
+
+Pass the two generated restricted profiles explicitly. The command validates them before the
+run, and each op builds settings from its own role profile. Credential values are not copied
+into Dagster run configuration or installed in the process environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m kedra orchestrate --config config.example.toml `
+  --start-date 2025-07-17 --end-date 2025-07-17 --body-id 15376 `
+  --ingest-env .local/ingest.env --transform-env .local/transform.env `
+  --run-directory .local/runs
+```
+
+The run directory receives `<dagster-run-id>-ingestion.jsonl` and, only after successful
+ingestion, `<dagster-run-id>-transformation.jsonl`. Files are created exclusively and each
+rerun gets a new run ID, so prior evidence is retained. Standard output contains one
+`orchestration_run_summary` with the artifact paths and both stage outcomes. Exit code 0
+means both stages completed; incomplete ingestion or transformation returns 3. Invalid
+dates, profiles, body scope or configuration return 2. Use `kedra ingest` and
+`kedra transform` when the stages need to be run independently.
+
+The installed job can be inspected without executing it:
+
+```powershell
+.\.venv\Scripts\dagster.exe job list -m kedra.orchestration
+```
+
 ### Immutable storage and its limits
 
 `ObjectStore.put_if_absent` uses `If-None-Match: *`, then reads and hashes the exact stored
@@ -372,11 +405,12 @@ uv pip check --python .venv/Scripts/python.exe --cache-dir .uv-cache
 .\.venv\Scripts\ruff.exe format --check .
 ```
 
-Default tests use synthetic inputs with DNS/socket access blocked; storage integration
-tests are skipped unless `--storage` is supplied. Dependency/import checks do not prove
-service behavior. The opt-in checks exercise local storage, fixed immutable ingestion assets
-and the standalone transformation CLI; no test proves current positive live scraping or an
-orchestrated end-to-end run.
+Default tests use synthetic inputs with external access blocked; storage integration tests
+are skipped unless `--storage` is supplied. Dagster's Windows event loop uses a local socket
+pair, so its execution tests permit local runtime sockets while mocking both pipeline stages.
+Dependency/import checks do not prove service behavior. The opt-in checks exercise local
+storage, fixed immutable assets, standalone transformation, and the two-stage Dagster CLI
+against a one-record loopback source. No test proves current positive live scraping.
 
 ## Design decisions and constraints
 

@@ -9,6 +9,7 @@ from kedra.config import load_settings
 from kedra.dates import DateRange, iter_partitions
 from kedra.discovery import run_discovery
 from kedra.ingestion import run_ingestion
+from kedra.orchestration import run_orchestration
 from kedra.transformation import run_transformation
 
 
@@ -58,9 +59,50 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="JSONL output from a complete ingestion run over the same scope",
     )
+    orchestrate = commands.add_parser(
+        "orchestrate",
+        help="run ingestion then transformation through their Dagster dependency",
+    )
+    orchestrate.add_argument("--config", required=True, type=Path)
+    orchestrate.add_argument("--start-date", required=True, help="inclusive YYYY-MM-DD")
+    orchestrate.add_argument("--end-date", required=True, help="inclusive YYYY-MM-DD")
+    orchestrate.add_argument(
+        "--body-id",
+        action="append",
+        dest="body_ids",
+        help="configured body ID to include; repeat as needed (default: all configured bodies)",
+    )
+    orchestrate.add_argument(
+        "--ingest-env",
+        required=True,
+        type=Path,
+        help="restricted ingestion NAME=VALUE credential profile",
+    )
+    orchestrate.add_argument(
+        "--transform-env",
+        required=True,
+        type=Path,
+        help="restricted transformation NAME=VALUE credential profile",
+    )
+    orchestrate.add_argument(
+        "--run-directory",
+        required=True,
+        type=Path,
+        help="ignored directory for per-run JSONL manifests and logs",
+    )
     args = parser.parse_args(argv)
     try:
         date_range = DateRange.from_inputs(args.start_date, args.end_date)
+        if args.command == "orchestrate":
+            return run_orchestration(
+                args.config,
+                date_range,
+                args.body_ids,
+                args.ingest_env,
+                args.transform_env,
+                args.run_directory,
+                sys.stdout,
+            )
         settings = load_settings(args.config)
         if args.command in ("discover", "ingest"):
             if args.body_ids and (

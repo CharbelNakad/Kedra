@@ -216,6 +216,64 @@ def test_transform_cli_requires_completed_ingestion_manifest():
     assert error.value.code == 2
 
 
+def test_orchestrate_cli_passes_profiles_and_run_directory_without_process_secrets(
+    monkeypatch, capsys, tmp_path
+):
+    captured = {}
+
+    def fake_run(
+        config_path,
+        date_range,
+        body_ids,
+        ingest_profile,
+        transform_profile,
+        run_directory,
+        stream,
+    ):
+        captured.update(
+            config_path=config_path,
+            date_range=date_range,
+            body_ids=body_ids,
+            ingest_profile=ingest_profile,
+            transform_profile=transform_profile,
+            run_directory=run_directory,
+            stream=stream,
+        )
+        return 3
+
+    monkeypatch.delenv("KEDRA_MONGO_URI", raising=False)
+    monkeypatch.setattr("kedra.cli.run_orchestration", fake_run)
+    result = main(
+        [
+            "orchestrate",
+            "--config",
+            EXAMPLE,
+            "--start-date",
+            "2025-07-17",
+            "--end-date",
+            "2025-07-17",
+            "--body-id",
+            "15376",
+            "--ingest-env",
+            str(tmp_path / "ingest.env"),
+            "--transform-env",
+            str(tmp_path / "transform.env"),
+            "--run-directory",
+            str(tmp_path / "runs"),
+        ]
+    )
+
+    assert result == 3
+    assert captured["config_path"] == Path(EXAMPLE)
+    assert captured["date_range"].end_exclusive.isoformat() == "2025-07-18"
+    assert captured["body_ids"] == ["15376"]
+    assert captured["ingest_profile"].name == "ingest.env"
+    assert captured["transform_profile"].name == "transform.env"
+    assert captured["run_directory"].name == "runs"
+    assert captured["stream"] is not None
+    assert capsys.readouterr().err == ""
+
+
 @pytest.mark.parametrize("command", ["discover", "ingest"])
 @pytest.mark.parametrize("body_ids", [["unknown"], ["15376", "15376"]])
 def test_discover_cli_rejects_unknown_or_duplicate_body_scope(
