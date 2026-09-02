@@ -16,6 +16,7 @@ from kedra.ingestion import (
     ConditionalAssetMiddleware,
     DecisionsIngestionSpider,
     DownloadedAsset,
+    IngestionRecordState,
     LandingAssetPipeline,
     LandingAssetService,
     PendingAssetRequest,
@@ -227,32 +228,35 @@ class MemoryStateCollection:
         self.documents[document["_id"]] = document
 
 
-class OneRecordRerunSpider(DecisionsIngestionSpider):
-    name = "controlled_one_record_rerun"
+class SequentialRerunSpider(DecisionsIngestionSpider):
+    """Run consecutive single-record checks with one reactor and shared storage."""
 
-    def __init__(self, probe_record, **kwargs):
+    name = "controlled_sequential_rerun"
+
+    def __init__(self, probe_records, **kwargs):
         super().__init__(**kwargs)
-        self.probe_record = probe_record
-        self.rerun_scheduled = False
+        self.probe_records = tuple(probe_records)
+        self.probe_index = 0
+
+    def _probe_request(self, record):
+        self.record_states[record.record_key] = IngestionRecordState(
+            record,
+            pending_requests={
+                "primary": PendingAssetRequest(record.source_url),
+            },
+            seen_assets={"primary"},
+        )
+        return self._asset_request(record.record_key, "primary", "primary", record.source_url)
 
     async def start(self):
-        for request in self._accepted_record_outputs(self.probe_record):
-            yield request
+        yield self._probe_request(self.probe_records[0])
 
     def asset_persisted(self, asset, result):
         super().asset_persisted(asset, result)
-        if self.rerun_scheduled:
+        self.probe_index += 1
+        if self.probe_index == len(self.probe_records):
             return
-        self.rerun_scheduled = True
-        state = self.record_states[self.probe_record.record_key]
-        state.pending_requests["rerun"] = PendingAssetRequest(self.probe_record.source_url)
-        request = self._asset_request(
-            self.probe_record.record_key,
-            "rerun",
-            "primary",
-            self.probe_record.source_url,
-        )
-        self.crawler.engine.crawl(request)
+        self.crawler.engine.crawl(self._probe_request(self.probe_records[self.probe_index]))
 
 
 def sample_asset(
@@ -544,6 +548,8 @@ def test_complete_fixture_ingestion_reconciles_one_record_and_one_asset(example_
     assert run["event"] == "ingestion_run_summary"
     assert run["discovery_complete"] is True
     assert run["successfully_available_records"] == 1
+    assert run["records_with_downloads"] == 1
+    assert run["records_reused_without_download"] == 0
     assert run["failed_documents"] == 0
     assert run["downloaded_files"] == run["stored_files"] == 1
     assert run["created_objects"] == run["inserted_metadata_versions"] == 1
@@ -669,6 +675,9 @@ def test_validator_backed_304_reuses_verified_landing_bytes_without_download(
     assert objects.put_calls == 1
     assert spider.record_states[sample_record().record_key].complete is True
     assert events[-1]["response_not_modified"] is True
+    summary = spider._stage_summary_fields(discovery_complete=True)
+    assert summary["records_with_downloads"] == 0
+    assert summary["records_reused_without_download"] == 1
 
 
 def test_validator_state_is_not_a_cache_hit_when_the_source_has_no_validator(example_env):
@@ -753,18 +762,46 @@ def test_validator_miss_with_changed_bytes_appends_a_new_immutable_version(
 
 
 @pytest.mark.local_http
-def test_two_real_http_requests_transfer_validator_backed_body_only_once(example_env):
+def test_controlled_http_rerun_matrix_preserves_versions_and_transfer_evidence(example_env):
     import threading
     from datetime import timedelta
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     from scrapy.crawler import CrawlerProcess
 
-    body = b"%PDF-1.4\ncontrolled conditional response"
+    validated_body = b"%PDF-1.4\nvalidator-backed response"
+    html_first = (
+        b"<html><body><div class='content'>Stable legal text.</div>"
+        b"<!-- Elapsed time: 001 --></body></html>"
+    )
+    html_changed = html_first.replace(b"001", b"002")
+    binary_first = b"%PDF-1.4\nsame-length-version-A"
+    binary_changed = b"%PDF-1.4\nsame-length-version-B"
+    assert len(html_first) == len(html_changed)
+    assert len(binary_first) == len(binary_changed)
 
     class Handler(BaseHTTPRequestHandler):
-        asset_requests = 0
+        asset_requests = {
+            "/validated.pdf": 0,
+            "/unvalidated.html": 0,
+            "/changing.pdf": 0,
+        }
         body_bytes_sent = 0
+        conditional_headers = {
+            "/validated.pdf": [],
+            "/unvalidated.html": [],
+            "/changing.pdf": [],
+        }
+
+        def send_body(self, body, media_type, etag=None):
+            self.send_response(200)
+            self.send_header("Content-Type", media_type)
+            self.send_header("Content-Length", str(len(body)))
+            if etag is not None:
+                self.send_header("ETag", etag)
+            self.end_headers()
+            self.wfile.write(body)
+            type(self).body_bytes_sent += len(body)
 
         def do_GET(self):
             if self.path == "/robots.txt":
@@ -775,22 +812,28 @@ def test_two_real_http_requests_transfer_validator_backed_body_only_once(example
                 self.end_headers()
                 self.wfile.write(robots)
                 return
-            if self.path != "/decision.pdf":
+            if self.path not in type(self).asset_requests:
                 self.send_error(404)
                 return
-            type(self).asset_requests += 1
-            if self.headers.get("If-None-Match") == '"controlled-etag"':
-                self.send_response(304)
-                self.send_header("ETag", '"controlled-etag"')
-                self.end_headers()
+            handler = type(self)
+            handler.asset_requests[self.path] += 1
+            validator = self.headers.get("If-None-Match")
+            handler.conditional_headers[self.path].append(validator)
+            if self.path == "/validated.pdf":
+                if validator == '"validated-v1"':
+                    self.send_response(304)
+                    self.send_header("ETag", '"validated-v1"')
+                    self.end_headers()
+                    return
+                self.send_body(validated_body, "application/pdf", '"validated-v1"')
                 return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/pdf")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("ETag", '"controlled-etag"')
-            self.end_headers()
-            self.wfile.write(body)
-            type(self).body_bytes_sent += len(body)
+            if self.path == "/unvalidated.html":
+                body = html_first if handler.asset_requests[self.path] < 3 else html_changed
+                self.send_body(body, "text/html")
+                return
+            body = binary_first if handler.asset_requests[self.path] == 1 else binary_changed
+            etag = '"binary-v1"' if handler.asset_requests[self.path] == 1 else '"binary-v2"'
+            self.send_body(body, "application/pdf", etag)
 
         def log_message(self, _format, *_args):
             return
@@ -816,31 +859,70 @@ def test_two_real_http_requests_transfer_validator_backed_body_only_once(example
                 rate_limit_backoff_max_seconds=0.1,
             ),
         )
-        record = replace(
+        validated_monthly = replace(
             sample_record(),
             source=settings.source.name,
-            source_url=f"{endpoint}/decision.pdf",
+            title="VALIDATED-0001",
+            reference_number="VALIDATED-0001",
+            description="Original listing metadata.",
+            source_url=f"{endpoint}/validated.pdf",
+            partition_date=date(2025, 7, 1),
+            partition_size="month",
+        )
+        validated_daily = replace(
+            validated_monthly,
+            partition_date=date(2025, 7, 17),
+            partition_size="day",
+        )
+        validated_metadata_change = replace(
+            validated_daily,
+            description="Corrected listing metadata.",
+        )
+        unvalidated_html = replace(
+            sample_record(),
+            source=settings.source.name,
+            title="HTML-0001",
+            reference_number="HTML-0001",
+            source_url=f"{endpoint}/unvalidated.html",
+        )
+        changing_binary = replace(
+            sample_record(),
+            source=settings.source.name,
+            title="BINARY-0001",
+            reference_number="BINARY-0001",
+            source_url=f"{endpoint}/changing.pdf",
+        )
+        probe_records = (
+            validated_monthly,
+            validated_daily,
+            validated_metadata_change,
+            unvalidated_html,
+            unvalidated_html,
+            unvalidated_html,
+            changing_binary,
+            changing_binary,
         )
         objects = MemoryObjectStore()
         metadata = MemoryMetadataStore()
+        state_collection = MemoryStateCollection()
         service = LandingAssetService(
             objects,
             metadata,
             "workplace-relations",
-            ValidatorStateStore(MemoryStateCollection()),
+            ValidatorStateStore(state_collection),
         )
         process = CrawlerProcess(ingestion_crawler_settings(settings), install_root_handler=False)
-        crawler = process.create_crawler(OneRecordRerunSpider)
+        crawler = process.create_crawler(SequentialRerunSpider)
         process.crawl(
             crawler,
             app_settings=settings,
             date_range=DateRange(
-                record.published_date,
-                record.published_date + timedelta(days=1),
+                validated_monthly.published_date,
+                validated_monthly.published_date + timedelta(days=1),
             ),
-            body_ids=[record.body_id],
+            body_ids=[validated_monthly.body_id],
             asset_service=service,
-            probe_record=record,
+            probe_records=probe_records,
         )
         process.start(stop_after_crawl=True)
     finally:
@@ -850,13 +932,71 @@ def test_two_real_http_requests_transfer_validator_backed_body_only_once(example
 
     spider = crawler.spider
     assert spider is not None
-    assert Handler.asset_requests == 2
-    assert Handler.body_bytes_sent == len(body)
-    assert spider.downloaded_files == 1
-    assert spider.not_modified_files == 1
-    assert spider.stored_files == 2
-    assert objects.put_calls == 1
-    assert len(objects.objects) == len(metadata.documents) == 1
+    assert Handler.asset_requests == {
+        "/validated.pdf": 3,
+        "/unvalidated.html": 3,
+        "/changing.pdf": 2,
+    }
+    assert Handler.conditional_headers["/validated.pdf"] == [
+        None,
+        '"validated-v1"',
+        '"validated-v1"',
+    ]
+    assert Handler.conditional_headers["/unvalidated.html"] == [None, None, None]
+    assert Handler.conditional_headers["/changing.pdf"] == [None, '"binary-v1"']
+    assert Handler.body_bytes_sent == (
+        len(validated_body)
+        + len(html_first) * 2
+        + len(html_changed)
+        + len(binary_first)
+        + len(binary_changed)
+    )
+    assert spider.downloaded_files == 6
+    assert spider.not_modified_files == 2
+    assert spider.stored_files == 8
+    assert spider.created_objects == 5
+    assert spider.reused_objects == 3
+    assert spider.inserted_metadata_versions == 6
+    assert spider.reused_metadata_versions == 2
+    assert objects.put_calls == 6
+    assert len(objects.objects) == 5
+    assert len(metadata.documents) == 6
+    assert set(objects.objects.values()) == {
+        validated_body,
+        html_first,
+        html_changed,
+        binary_first,
+        binary_changed,
+    }
+    validated_documents = [
+        document
+        for document in metadata.documents.values()
+        if document["record_key"] == validated_monthly.record_key
+    ]
+    assert len(validated_documents) == 2
+    assert {document["description"] for document in validated_documents} == {
+        "Original listing metadata.",
+        "Corrected listing metadata.",
+    }
+    original_document = next(
+        document
+        for document in validated_documents
+        if document["description"] == "Original listing metadata."
+    )
+    assert original_document["partition_size"] == "month"
+    assert validated_monthly.metadata_hash == validated_daily.metadata_hash
+    validated_state = state_collection.documents[
+        validator_state_id(validated_monthly.record_key, validated_monthly.source_url)
+    ]
+    assert validated_state["landing_version_id"] == next(
+        version_id
+        for version_id, document in metadata.documents.items()
+        if document["description"] == "Corrected listing metadata."
+    )
+    summary = spider._stage_summary_fields(discovery_complete=True)
+    assert summary["successfully_available_records"] == 3
+    assert summary["records_reused_without_download"] == 1
+    assert summary["records_with_downloads"] == 2
     assert spider.exit_code == 0
 
 

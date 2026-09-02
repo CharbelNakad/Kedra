@@ -823,6 +823,9 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
         successful = sum(state.complete for state in states)
         malformed_records = sum(summary.malformed_cards for summary in self.summaries.values())
         document_candidates = len(states) + malformed_records
+        records_reused_without_download = sum(
+            state.complete and state.downloaded_assets == 0 for state in states
+        )
         failures = [failure for state in states for failure in state.failures]
         pending = sum(
             len(state.pending_requests) + len(state.pending_persistence) for state in states
@@ -835,6 +838,8 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
             ),
             "ingestion_records": document_candidates,
             "successfully_available_records": successful,
+            "records_with_downloads": successful - records_reused_without_download,
+            "records_reused_without_download": records_reused_without_download,
             "failed_documents": document_candidates - successful,
             "downloaded_files": self.downloaded_files,
             "not_modified_files": self.not_modified_files,

@@ -176,8 +176,10 @@ JSON Lines events distinguish downloads, storage outcomes and failures. The fina
 `ingestion_run_summary` reconciles available/failed records, downloaded/stored files,
 validator-backed `not_modified_files`, new/reused objects and metadata versions, and failed
 asset URLs. Malformed listing cards count as failed documents even though they cannot become
-metadata records. Exit code 0 requires both complete listing enumeration and every required
-asset; incomplete work returns 3.
+metadata records. Successful records are divided into `records_with_downloads` and
+`records_reused_without_download`; an identical object found only after receiving a 200 body
+stays in the former category. Exit code 0 requires both complete listing enumeration and
+every required asset; incomplete work returns 3.
 
 When a successful response supplies `ETag` or `Last-Modified`, ingestion stores that opaque
 server validator in the mutable `crawl_state` collection. A later request first verifies the
@@ -187,12 +189,19 @@ metadata version are reused. A 200 response is classified and hashed normally; c
 append a new immutable object/version. Validator reads run in a worker thread and never turn
 an unverified or missing local object into a cache hit.
 
-The public source returned a zero-byte HTTP 200 during the bounded source recheck, so this command
-has not received a positive current live-source validation and must not be used to bypass
-that refusal. PDF/DOC/DOCX, redirects, wrappers, multi-asset behavior and conditional 304
-handling are verified with controlled fixtures. The original bounded inspection showed that
-sample decision HTML had no ETag or Last-Modified. Those pages must still be fetched to detect
-silent edits; trusting the cache would avoid transfers but could return stale legal content.
+Version identity includes the exact raw byte hash and stable source metadata, while excluding
+partition labels and query windows. An overlapping daily/monthly check therefore reuses the
+same source version. A listing-only metadata correction creates another metadata version
+around the verified existing object. Equal content length is never equality evidence:
+same-length binary edits and HTML timing-comment edits retain separate raw versions.
+
+The public source returned a zero-byte HTTP 200 during the bounded source recheck, so this
+command has not received a positive current live-source validation and must not be used to
+bypass that refusal. PDF/DOC/DOCX, redirects, wrappers, multi-asset behavior and the rerun
+matrix are verified with controlled fixtures and a loopback HTTP server. The original bounded
+inspection showed that sample decision HTML had no ETag or Last-Modified. Those pages must
+still be fetched to detect silent edits; trusting the cache would avoid transfers but could
+return stale legal content.
 
 ### Immutable storage and its limits
 
