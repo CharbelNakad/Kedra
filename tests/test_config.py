@@ -12,6 +12,7 @@ def test_example_config_and_secrets_load_without_connections(example_env):
     settings = load_settings(EXAMPLE, example_env)
     assert settings.source.body_ids == ("2", "1", "3", "15376")
     assert settings.scraping.partition_size == "month"
+    assert settings.scraping.user_agent == "Kedra/0.1 (+rate-limited coding-test client)"
     assert settings.storage.landing_bucket != settings.storage.transformed_bucket
     for secret in example_env.values():
         assert secret not in repr(settings)
@@ -34,6 +35,10 @@ def test_missing_or_blank_required_secrets_are_rejected(example_env, env_name, v
     "old,new",
     [
         ('partition_size = "month"', 'partition_size = "week"'),
+        (
+            'user_agent = "Kedra/0.1 (+rate-limited coding-test client)"',
+            'user_agent = ""',
+        ),
         ("download_delay_seconds = 2.0", "download_delay_seconds = 0"),
         ("timeout_seconds = 25.0", "timeout_seconds = nan"),
         ("timeout_seconds = 25.0", "timeout_seconds = inf"),
@@ -67,14 +72,25 @@ def test_nonsecret_settings_can_be_changed_without_code_edits(tmp_path, example_
     path = tmp_path / "config.toml"
     text = EXAMPLE.read_text().replace('partition_size = "month"', 'partition_size = "day"')
     text = text.replace('body_ids = ["2", "1", "3", "15376"]', 'body_ids = ["3"]')
+    text = text.replace(
+        'user_agent = "Kedra/0.1 (+rate-limited coding-test client)"',
+        'user_agent = "Kedra-fixture/2.0"',
+    )
     text = text.replace('mongo_database = "kedra"', 'mongo_database = "kedra_test"')
     text = text.replace("http://localhost:8333", "http://localhost:9333")
     path.write_text(text, encoding="utf-8")
     settings = load_settings(path, example_env)
     assert settings.scraping.partition_size == "day"
     assert settings.source.body_ids == ("3",)
+    assert settings.scraping.user_agent == "Kedra-fixture/2.0"
     assert settings.storage.mongo_database == "kedra_test"
     assert settings.storage.s3_endpoint_url == "http://localhost:9333"
+
+
+def test_user_agent_control_characters_are_rejected(example_env):
+    scraping = load_settings(EXAMPLE, example_env).scraping
+    with pytest.raises(ValueError, match="control characters"):
+        replace(scraping, user_agent="Kedra/0.1\nInjected: value")
 
 
 def test_invalid_mongo_uri_does_not_disclose_its_value(example_env):

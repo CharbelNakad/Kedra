@@ -6,6 +6,7 @@ body_ids = ["2", "1", "3", "15376"]
 
 [scraping]
 partition_size = "month" # "month" or "day"
+user_agent = "Kedra/0.1 (+rate-limited coding-test client)"
 download_delay_seconds = 2.0
 concurrency_per_domain = 1
 timeout_seconds = 25.0

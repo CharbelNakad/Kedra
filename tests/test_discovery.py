@@ -350,6 +350,7 @@ def test_scrapy_limits_and_source_policy_are_driven_by_config(example_env):
     settings = load_settings(EXAMPLE, example_env)
     scrapy_settings = crawler_settings(settings)
     assert scrapy_settings["ROBOTSTXT_OBEY"] is True
+    assert scrapy_settings["USER_AGENT"] == settings.scraping.user_agent
     assert scrapy_settings["DOWNLOAD_DELAY"] == settings.scraping.download_delay_seconds
     assert scrapy_settings["CONCURRENT_REQUESTS_PER_DOMAIN"] == 1
     assert scrapy_settings["DOWNLOAD_TIMEOUT"] == settings.scraping.timeout_seconds
@@ -568,6 +569,33 @@ def test_429_retry_after_creates_a_shared_nonblocking_origin_cooldown(example_en
             "attempt_count": 1,
             "backoff_seconds": 60.0,
             "backoff_source": "retry_after",
+        }
+    ]
+
+
+def test_empty_http_200_retries_with_a_shared_nonblocking_origin_cooldown(example_env):
+    app_settings = load_settings(EXAMPLE, example_env)
+    waits = []
+    events = []
+    middleware, spider = _rate_limit_middleware(app_settings, waits, events)
+    request = Request(WRC_PAGE_1)
+    empty = HtmlResponse(request.url, status=200, body=b"", request=request)
+
+    retry = middleware.process_response(request, empty, spider)
+
+    assert isinstance(retry, Request)
+    assert retry.meta["retry_times"] == 1
+    assert middleware.process_request(Request(WRC_PAGE_2), spider) == "nonblocking-wait"
+    assert waits == [2.0]
+    assert events == [
+        {
+            "event": "soft_block_detected",
+            "url": WRC_PAGE_1,
+            "http_status": 200,
+            "attempt_count": 1,
+            "backoff_seconds": 2.0,
+            "backoff_source": "exponential_backoff",
+            "retry_scheduled": True,
         }
     ]
 

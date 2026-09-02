@@ -9,6 +9,10 @@ Scrapy to download explicit decision assets into the Landing Zone. Transformatio
 independently runnable, and a local Dagster job connects ingestion to transformation through
 a completed-run manifest. Separate administration commands provision local storage.
 
+For a step-by-step walkthrough that runs the production pipeline against a deterministic local
+source, inspects MongoDB and object bytes, proves an unchanged rerun, and separately exercises
+1,000 records, start with [Manual end-to-end testing](docs/manual-testing.md).
+
 ## Setup (PowerShell)
 
 Install Python 3.12 and [uv](https://docs.astral.sh/uv/). From the repository root:
@@ -80,19 +84,26 @@ skipped/repeated pages, changing totals, malformed cards, identity collisions, c
 mismatches and a configured page safety limit. Exact duplicate cards are counted separately
 from conflicting cards that share a logical record key.
 
-Scrapy obeys `robots.txt`, disables cookies, uses AutoThrottle plus the configured per-domain
-concurrency, delay, timeout, retry count and response-size limit. A 429 response creates a
-shared cooldown for that origin: a valid `Retry-After` controls the delay, while a missing or
-invalid header uses randomized exponential backoff capped by
+Scrapy obeys `robots.txt`, disables cookies, and sends the configured `user_agent`. It uses
+AutoThrottle plus the configured per-domain concurrency, delay, timeout, retry count and
+response-size limit. A 429 response creates a shared cooldown for that origin: a valid
+`Retry-After` controls the delay, while a missing or invalid header uses randomized
+exponential backoff capped by
 `rate_limit_backoff_max_seconds`. Waiting is asynchronous, so it does not block Scrapy's
-reactor. The default page safety limit is 1,000 pages per body/partition; reaching it fails
-the partition rather than reporting truncated success. Tune these values in TOML, not source.
+reactor. An empty HTTP 200 is treated as a soft block and gets the same bounded fallback
+before the partition fails visibly. The default page safety limit is 1,000 pages per
+body/partition; reaching it fails the partition rather than reporting truncated success.
+Tune these values in TOML, not source.
 
-The bounded 2026-09-01 recheck of the previously known 17 July 2025 WRC result returned
-HTTP 200 with an empty body. The command correctly reported `empty_listing_response` and
-did not request page 2 or any decision. Offline fixtures still prove the previously observed
-10+2 pagination contract, but current positive live discovery remains unverified while the
-source returns empty responses. Do not try alternate clients to bypass a source refusal.
+The bounded 2026-09-02 diagnosis reproduced the former empty response with both Scrapy and
+curl and isolated it to the old hard-coded user-agent value: the word `discovery` produced a
+zero-byte HTTP 200, while the same client immediately received full HTML with a neutral,
+honest application identifier. No cookies, session bootstrap, JavaScript, browser, proxy or
+TLS impersonation was needed. With the configured neutral value, the live Scrapy check
+enumerated both pages and all 12 advertised records for body `15376` on 17 July 2025. The
+much broader all-body query from 2 December 2024 through 2 September 2026 advertised 4,911
+records; it was inspected only at page 1 and should be split by body and calendar partition
+instead of used as one bulk crawl.
 
 ## Local storage (PowerShell)
 
@@ -209,13 +220,13 @@ in immutable metadata and every `asset_stored` event reports the current final U
 Consumers that need an immutable history of transport-only changes would need a separate
 append-only observation log; the Landing content model does not provide that history.
 
-The public source returned a zero-byte HTTP 200 during the bounded source recheck, so this
-command has not received a positive current live-source validation and must not be used to
-bypass that refusal. PDF/DOC/DOCX, redirects, wrappers, multi-asset behavior and the rerun
-matrix are verified with controlled fixtures and a loopback HTTP server. The original bounded
-inspection showed that sample decision HTML had no ETag or Last-Modified. Those pages must
-still be fetched to detect silent edits; trusting the cache would avoid transfers but could
-return stale legal content.
+Current filtered-listing discovery is positively validated. One known live HTML decision was
+fetched read-only into temporary diagnostics and passed the production format/content
+inspection; it was not run through Landing storage. PDF/DOC/DOCX, redirects, wrappers,
+multi-asset behavior and the rerun matrix are verified with controlled fixtures and a
+loopback HTTP server. The original bounded inspection showed that sample decision HTML had
+no ETag or Last-Modified. Those pages must still be fetched to detect silent edits; trusting
+the cache would avoid transfers but could return stale legal content.
 
 ## Standalone transformation (PowerShell)
 
@@ -277,12 +288,13 @@ interruption after object creation is recovered by completing metadata on the ne
 source or Landing data is updated, renamed or deleted.
 
 The extraction contract is verified against controlled HTML fixtures and local Docker
-storage. It has not been revalidated against current WRC pages because the bounded source
-recheck returned an empty response. The parser requires the observed content/wrapper signals
-and rejects multiple page titles; when a page title is absent, it uses the validated metadata
-identifier. A future source-layout change will fail for review rather than silently storing
-incomplete legal text. Wrapper output preserves source-link provenance; it does not rewrite
-links to transformed object URLs.
+storage. A current WRC HTML decision also passed the production HTML inspection and
+deterministic content transform in memory: one `.content` region and the expected page title
+produced a 4,178-byte cleaned document. The parser requires the observed content/wrapper
+signals and rejects multiple page titles; when a page title is absent, it uses the validated
+metadata identifier. A future source-layout change will fail for review rather than silently
+storing incomplete legal text. Wrapper output preserves source-link provenance; it does not
+rewrite links to transformed object URLs.
 
 ## Orchestrated ingestion and transformation (PowerShell)
 
@@ -412,7 +424,35 @@ are skipped unless `--storage` is supplied. Dagster's Windows event loop uses a 
 pair, so its execution tests permit local runtime sockets while mocking both pipeline stages.
 Dependency/import checks do not prove service behavior. The opt-in checks exercise local
 storage, fixed immutable assets, standalone transformation, and the two-stage Dagster CLI
-against a one-record loopback source. No test proves current positive live scraping.
+against a one-record loopback source. The bounded live discovery test proves current result
+enumeration for one known 12-record day/body; it does not prove live document ingestion,
+format coverage or a safe maximum request rate.
+
+## Controlled reliability exercise
+
+Run the assignment-sized exercise without contacting WRC or Docker:
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts\reliability_exercise.py --records 1000
+```
+
+It serves 100 deterministic listing pages on loopback and processes 1,000 records through the
+real Scrapy callbacks: 250 HTML, PDF, DOC and DOCX assets each. It injects a 429 with
+`Retry-After`, a 503, a timeout, malformed HTML and a one-time storage interruption. The first
+run must reconcile 998 successful and two failed records. A controlled recovery creates only
+the two missing Landing versions; the next persistence pass reuses all 1,000. Transformation
+then creates and reuses all 1,000 outputs, verifies exact binary hashes and checks every output
+basename.
+
+The final JSON reports elapsed time, peak Python memory tracked by `tracemalloc`, actual and
+configured HTTP concurrency, injected outcomes, recovery and rerun counts. The regression
+requires peak traced Python memory below 256 MiB and active requests within the configured
+cap; elapsed time is measured but not asserted because host speed varies. This is an
+in-memory storage and loopback network exercise. Docker integration tests separately verify
+the real permission and persistence boundaries; neither check measures current WRC capacity
+or proves the proposed million-document design.
+
+The concise system rationale is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Design decisions and constraints
 

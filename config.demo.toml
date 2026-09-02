@@ -1,0 +1,29 @@
+# Deterministic loopback source used by docs/manual-testing.md.
+[source]
+name = "kedra-manual-demo-v1"
+search_url = "http://127.0.0.1:18766/search/"
+body_ids = ["2", "1", "3", "15376"]
+
+[scraping]
+partition_size = "day"
+download_delay_seconds = 0.05
+concurrency_per_domain = 2
+timeout_seconds = 5.0
+retry_times = 2
+rate_limit_backoff_max_seconds = 2.0
+max_response_bytes = 20971520
+max_pages_per_partition = 10
+
+[storage]
+mongo_database = "kedra"
+landing_collection = "landing_metadata"
+transformed_collection = "transformed_metadata"
+state_collection = "crawl_state"
+s3_endpoint_url = "http://localhost:8333"
+s3_region = "us-east-1"
+landing_bucket = "kedra-landing"
+transformed_bucket = "kedra-transformed"
+object_prefix = "manual-demo"
+connect_timeout_seconds = 5
+read_timeout_seconds = 30
+max_attempts = 3

@@ -506,7 +506,7 @@ def _wait_without_blocking(delay_seconds: float):
 
 
 class RateLimitRetryMiddleware(RetryMiddleware):
-    """Retry 429 responses after a shared, nonblocking origin cooldown."""
+    """Retry rate limits and empty soft-block responses after a shared cooldown."""
 
     def __init__(
         self,
@@ -552,6 +552,12 @@ class RateLimitRetryMiddleware(RetryMiddleware):
         ceiling = min(self.backoff_max, self.backoff_base * (2**retry_count))
         return self.jitter(ceiling / 2, ceiling)
 
+    def _start_cooldown(self, request: Request, delay: float) -> None:
+        origin = self._origin(request.url)
+        self.cooldown_until[origin] = max(
+            self.cooldown_until.get(origin, 0.0), self.clock() + delay
+        )
+
     def process_request(self, request: Request, spider=None):
         origin = self._origin(request.url)
         remaining = self.cooldown_until.get(origin, 0.0) - self.clock()
@@ -563,15 +569,29 @@ class RateLimitRetryMiddleware(RetryMiddleware):
         return None
 
     def process_response(self, request: Request, response: HtmlResponse, spider=None):
+        active_spider = spider or self.crawler.spider
+        if response.status == 200 and not response.body:
+            delay = self._fallback_delay(request)
+            self._start_cooldown(request, delay)
+            retry = self._retry(request, "empty HTTP 200 response")
+            if active_spider is not None and hasattr(active_spider, "_emit"):
+                active_spider._emit(
+                    {
+                        "event": "soft_block_detected",
+                        "url": request.url,
+                        "http_status": 200,
+                        "attempt_count": request.meta.get("retry_times", 0) + 1,
+                        "backoff_seconds": delay,
+                        "backoff_source": "exponential_backoff",
+                        "retry_scheduled": retry is not None,
+                    }
+                )
+            return retry or response
         if response.status == 429:
             retry_after = self._retry_after(response)
             source = "retry_after" if retry_after is not None else "exponential_backoff"
             delay = retry_after if retry_after is not None else self._fallback_delay(request)
-            origin = self._origin(request.url)
-            self.cooldown_until[origin] = max(
-                self.cooldown_until.get(origin, 0.0), self.clock() + delay
-            )
-            active_spider = spider or self.crawler.spider
+            self._start_cooldown(request, delay)
             if active_spider is not None and hasattr(active_spider, "_emit"):
                 active_spider._emit(
                     {
@@ -870,7 +890,7 @@ def crawler_settings(settings: Settings) -> dict[str, Any]:
     return {
         "LOG_ENABLED": False,
         "ROBOTSTXT_OBEY": True,
-        "USER_AGENT": "Kedra coding-test discovery/0.1",
+        "USER_AGENT": scraping.user_agent,
         "COOKIES_ENABLED": False,
         "TELNETCONSOLE_ENABLED": False,
         "DOWNLOAD_DELAY": scraping.download_delay_seconds,

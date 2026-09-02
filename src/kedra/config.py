@@ -50,10 +50,14 @@ class ScrapingSettings:
     rate_limit_backoff_max_seconds: float
     max_response_bytes: int
     max_pages_per_partition: int
+    user_agent: str = "Kedra/0.1 (+rate-limited coding-test client)"
 
     def __post_init__(self) -> None:
         if self.partition_size not in ("month", "day"):
             raise ValueError("scraping.partition_size must be month or day")
+        _text(self.user_agent, "scraping.user_agent")
+        if any(ord(character) < 32 or ord(character) == 127 for character in self.user_agent):
+            raise ValueError("scraping.user_agent must not contain control characters")
         for name in (
             "download_delay_seconds",
             "timeout_seconds",
