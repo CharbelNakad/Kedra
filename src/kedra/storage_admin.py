@@ -304,6 +304,83 @@ def landing_validator() -> dict:
     }
 
 
+def transformed_validator() -> dict:
+    """Require complete output provenance for every new transformed metadata version."""
+    required = [
+        "_id",
+        "schema_version",
+        "landing_version_id",
+        "transform_version",
+        "record_key",
+        "asset_id",
+        "asset_role",
+        "source",
+        "body_id",
+        "title",
+        "identifier",
+        "reference_number",
+        "description",
+        "published_date",
+        "source_date_raw",
+        "date_semantics",
+        "source_url",
+        "partition_date",
+        "partition_size",
+        "asset_source_url",
+        "asset_final_url",
+        "media_type",
+        "landing_object_bucket",
+        "landing_object_key",
+        "landing_file_hash",
+        "object_bucket",
+        "object_key",
+        "file_hash",
+        "size_bytes",
+        "document_format",
+        "content_transformed",
+    ]
+    sha256 = "^[0-9a-f]{64}$"
+    return {
+        "$jsonSchema": {
+            "bsonType": "object",
+            "required": required,
+            "properties": {
+                "_id": {"bsonType": "string", "pattern": sha256},
+                "schema_version": {"enum": [1]},
+                "landing_version_id": {"bsonType": "string", "pattern": sha256},
+                "transform_version": {"bsonType": "string", "minLength": 1},
+                "record_key": {"bsonType": "string", "pattern": sha256},
+                "asset_id": {"bsonType": "string", "minLength": 1},
+                "asset_role": {"enum": ["primary", "wrapper", "attachment", "continuation"]},
+                "source": {"bsonType": "string", "minLength": 1},
+                "body_id": {"bsonType": "string", "minLength": 1},
+                "title": {"bsonType": "string", "minLength": 1},
+                "identifier": {"bsonType": "string", "minLength": 1},
+                "reference_number": {"bsonType": ["string", "null"]},
+                "description": {"bsonType": ["string", "null"]},
+                "published_date": {"bsonType": "date"},
+                "source_date_raw": {"bsonType": "string", "minLength": 1},
+                "date_semantics": {"enum": ["decision_or_determination_date"]},
+                "source_url": {"bsonType": "string", "minLength": 1},
+                "partition_date": {"bsonType": "date"},
+                "partition_size": {"enum": ["month", "day"]},
+                "asset_source_url": {"bsonType": "string", "minLength": 1},
+                "asset_final_url": {"bsonType": "string", "minLength": 1},
+                "media_type": {"bsonType": "string", "minLength": 1},
+                "landing_object_bucket": {"bsonType": "string", "minLength": 1},
+                "landing_object_key": {"bsonType": "string", "minLength": 1},
+                "landing_file_hash": {"bsonType": "string", "pattern": sha256},
+                "object_bucket": {"bsonType": "string", "minLength": 1},
+                "object_key": {"bsonType": "string", "minLength": 1},
+                "file_hash": {"bsonType": "string", "pattern": sha256},
+                "size_bytes": {"bsonType": ["int", "long"], "minimum": 1},
+                "document_format": {"enum": ["html", "pdf", "doc", "docx"]},
+                "content_transformed": {"bsonType": "bool"},
+            },
+        }
+    }
+
+
 def bootstrap(config: Path, directory: Path = LOCAL_DIRECTORY) -> None:
     admin = local_settings(config, "admin", directory)
     with mongo_client(admin) as client:
@@ -316,13 +393,18 @@ def bootstrap(config: Path, directory: Path = LOCAL_DIRECTORY) -> None:
             admin.state_collection,
         ):
             if name not in existing:
+                validator = None
+                if name == admin.landing_collection:
+                    validator = landing_validator()
+                elif name == admin.transformed_collection:
+                    validator = transformed_validator()
                 options = (
                     {
-                        "validator": landing_validator(),
+                        "validator": validator,
                         "validationLevel": "strict",
                         "validationAction": "error",
                     }
-                    if name == admin.landing_collection
+                    if validator is not None
                     else {}
                 )
                 db.create_collection(name, **options)
@@ -331,6 +413,13 @@ def bootstrap(config: Path, directory: Path = LOCAL_DIRECTORY) -> None:
             "collMod",
             admin.landing_collection,
             validator=landing_validator(),
+            validationLevel="strict",
+            validationAction="error",
+        )
+        db.command(
+            "collMod",
+            admin.transformed_collection,
+            validator=transformed_validator(),
             validationLevel="strict",
             validationAction="error",
         )
@@ -350,6 +439,15 @@ def bootstrap(config: Path, directory: Path = LOCAL_DIRECTORY) -> None:
             name="logical_landing_version",
             unique=True,
             partialFilterExpression={field: {"$type": "string"} for field, _ in logical_fields},
+        )
+        transformed_logical_fields = [("landing_version_id", 1), ("transform_version", 1)]
+        db[admin.transformed_collection].create_index(
+            transformed_logical_fields,
+            name="logical_transformed_version",
+            unique=True,
+            partialFilterExpression={
+                field: {"$type": "string"} for field, _ in transformed_logical_fields
+            },
         )
         privileges = {
             "ingest": [

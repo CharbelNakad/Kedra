@@ -23,6 +23,7 @@ from kedra.storage import (
     s3_client,
 )
 from kedra.storage_admin import local_settings
+from kedra.transformation import LandingAsset, TransformedVersion
 
 pytestmark = pytest.mark.storage
 EXAMPLE = Path(__file__).resolve().parents[2] / "config.example.toml"
@@ -125,10 +126,9 @@ def test_published_date_queries_use_inclusive_calendar_boundaries(stores, sample
     _, _, _, metadata, objects = stores
     version = _stored_version(objects, sample)
     metadata.insert_if_absent(version)
-    assert [
-        item["_id"]
-        for item in metadata.find_published_between(date(2024, 2, 29), date(2024, 2, 29))
-    ] == [version.version_id]
+    same_day = metadata.find_published_between(date(2024, 2, 29), date(2024, 2, 29))
+    assert version.version_id in {item["_id"] for item in same_day}
+    assert all(item["published_date"].date() == date(2024, 2, 29) for item in same_day)
     assert version.version_id not in {
         item["_id"] for item in metadata.find_published_between(date(2024, 2, 1), date(2024, 2, 28))
     }
@@ -179,8 +179,17 @@ def test_s3_gateway_rejects_mutating_or_unconditional_requests(stores, operation
 
 def test_transform_credentials_can_read_landing_and_write_only_separate_outputs(stores, sample):
     _, _, _, metadata, objects = stores
-    body, _, key, _, _ = sample
-    version = _stored_version(objects, sample)
+    body, record, key, _, document_format = sample
+    version = LandingVersion(
+        record,
+        "transform-check",
+        document_format,
+        objects.put_if_absent(key, body),
+        asset_role="primary",
+        asset_source_url=record.source_url,
+        asset_final_url=record.source_url,
+        media_type="text/html",
+    )
     metadata.insert_if_absent(version)
     settings = local_settings(EXAMPLE, "transform")
     with mongo_client(settings) as mongo, closing(s3_client(settings)) as client:
@@ -196,18 +205,26 @@ def test_transform_credentials_can_read_landing_and_write_only_separate_outputs(
             db[settings.landing_collection].insert_one({"_id": "transform-denied"})
         assert error.value.code == 13
         output = ObjectStore(client, settings.transformed_bucket, settings.object_prefix)
-        output.put_if_absent(key, body)
+        output_receipt = output.put_if_absent(key, body)
         assert output.read(key, version.stored_object.file_hash) == body
-        output_document = {
-            "_id": version.version_id,
-            "published_date": version.to_document()["published_date"],
-        }
+        output_version = TransformedVersion(
+            LandingAsset.from_document(version.to_document(), settings.landing_bucket),
+            output_receipt,
+            content_transformed=True,
+        )
+        output_document = output_version.to_document()
         try:
             db[settings.transformed_collection].insert_one(output_document)
         except DuplicateKeyError:
-            assert db[settings.transformed_collection].find_one({"_id": version.version_id}) == (
-                output_document
+            assert (
+                db[settings.transformed_collection].find_one({"_id": output_version.version_id})
+                == output_document
             )
+        with pytest.raises(WriteError) as invalid_output:
+            db[settings.transformed_collection].insert_one({"_id": "0" * 64})
+        assert invalid_output.value.code == 121
+        with pytest.raises(DuplicateKeyError):
+            db[settings.transformed_collection].insert_one({**output_document, "_id": "f" * 64})
         assert settings.transformed_collection != settings.landing_collection
         assert settings.transformed_bucket != settings.landing_bucket
 

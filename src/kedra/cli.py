@@ -9,6 +9,7 @@ from kedra.config import load_settings
 from kedra.dates import DateRange, iter_partitions
 from kedra.discovery import run_discovery
 from kedra.ingestion import run_ingestion
+from kedra.transformation import run_transformation
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,6 +45,13 @@ def main(argv: list[str] | None = None) -> int:
         dest="body_ids",
         help="configured body ID to include; repeat as needed (default: all configured bodies)",
     )
+    transform = commands.add_parser(
+        "transform",
+        help="read Landing assets and append deterministic outputs to separate storage",
+    )
+    transform.add_argument("--config", required=True, type=Path)
+    transform.add_argument("--start-date", required=True, help="inclusive YYYY-MM-DD")
+    transform.add_argument("--end-date", required=True, help="inclusive YYYY-MM-DD")
     args = parser.parse_args(argv)
     try:
         date_range = DateRange.from_inputs(args.start_date, args.end_date)
@@ -56,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--body-id must select distinct configured source body IDs")
             runner = run_discovery if args.command == "discover" else run_ingestion
             return runner(settings, date_range, args.body_ids, sys.stdout)
+        if args.command == "transform":
+            return run_transformation(settings, date_range, sys.stdout)
         count = 0
         preview = []
         last_label = None

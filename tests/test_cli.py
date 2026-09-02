@@ -158,6 +158,38 @@ def test_ingest_cli_passes_validated_scope_to_scrapy(monkeypatch, capsys, exampl
     assert capsys.readouterr().err == ""
 
 
+def test_transform_cli_passes_validated_date_range_to_standalone_runner(
+    monkeypatch, capsys, example_env
+):
+    for name, value in example_env.items():
+        monkeypatch.setenv(name, value)
+    captured = {}
+
+    def fake_run(settings, date_range, stream):
+        captured.update(settings=settings, date_range=date_range, stream=stream)
+        return 3
+
+    monkeypatch.setattr("kedra.cli.run_transformation", fake_run)
+    result = main(
+        [
+            "transform",
+            "--config",
+            EXAMPLE,
+            "--start-date",
+            "2025-07-17",
+            "--end-date",
+            "2025-07-18",
+        ]
+    )
+
+    assert result == 3
+    assert captured["date_range"].start.isoformat() == "2025-07-17"
+    assert captured["date_range"].end_exclusive.isoformat() == "2025-07-19"
+    assert captured["settings"].storage.transformed_bucket == "kedra-transformed"
+    assert captured["stream"] is not None
+    assert capsys.readouterr().err == ""
+
+
 @pytest.mark.parametrize("command", ["discover", "ingest"])
 @pytest.mark.parametrize("body_ids", [["unknown"], ["15376", "15376"]])
 def test_discover_cli_rejects_unknown_or_duplicate_body_scope(

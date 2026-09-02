@@ -2,11 +2,12 @@
 
 Python utilities for the Workplace Relations coding test: configuration validation,
 calendar partitions, filtered result discovery, immutable decision-asset ingestion,
-stable document identity and persistent local storage.
+stable document identity, persistent local storage and deterministic transformation.
 
 The application can preview configuration offline, enumerate filtered result cards, or use
-Scrapy to download explicit decision assets into the Landing Zone. Separate administration
-commands provision local storage. Transformation and orchestration are not implemented.
+Scrapy to download explicit decision assets into the Landing Zone. A standalone command
+transforms stored assets into separate output storage. Separate administration commands
+provision local storage; orchestration is not implemented.
 
 ## Setup (PowerShell)
 
@@ -214,6 +215,54 @@ inspection showed that sample decision HTML had no ETag or Last-Modified. Those 
 still be fetched to detect silent edits; trusting the cache would avoid transfers but could
 return stale legal content.
 
+## Standalone transformation (PowerShell)
+
+Load the restricted transformation profile after storage has been bootstrapped:
+
+```powershell
+Get-Content .local/transform.env | ForEach-Object {
+    $name, $value = $_ -split '=', 2
+    [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+}
+.\.venv\Scripts\python.exe -m kedra transform --config config.example.toml `
+  --start-date 2025-07-17 --end-date 2025-07-17
+```
+
+Both dates are inclusive and refer to the source's displayed decision/determination date.
+The command queries indexed Landing metadata in MongoDB, follows the stored object keys and
+does not access the WRC website. It selects every immutable Landing asset version in range;
+the future orchestrated path will narrow that boundary with a completed ingestion manifest.
+
+PDF, DOC and DOCX bytes are copied exactly. HTML is parsed with BeautifulSoup into a stable
+UTF-8 document containing the `h1.page-title` identifier and the single `.content` decision
+region. Site headers, footers, navigation, buttons, scripts, styles, known search controls and
+comments inside that region are removed. Recognized wrapper pages produce a small attachment
+index from explicit download or semantic continuation links. A missing, empty or ambiguous
+decision region and a wrapper without document links fail visibly instead of producing an
+empty output.
+
+Every output is written through the create-only gateway to the distinct transformed bucket.
+The basename is the reversibly encoded `identifier.ext`; parent segments retain record,
+Landing-version, transform-version and asset identity so same-named assets cannot collide.
+The separate transformed Mongo collection records the new path/hash and the exact Landing
+object/hash it came from. HTML receives a new SHA-256 over its cleaned bytes; binary hashes
+remain equal because the bytes are unchanged.
+
+JSON Lines events report each success or failure and reconcile selected, transformed, failed,
+HTML, binary, created and reused counts. Exit code 0 means every selected asset succeeded; 3
+means one or more assets failed or the storage query was unavailable. Successful outputs are
+kept when another asset fails. Rerunning reuses matching output objects and metadata. As with
+Landing ingestion, an interruption after object creation is recovered by completing metadata
+on the next run; no source or Landing data is updated, renamed or deleted.
+
+The extraction contract is verified against controlled HTML fixtures and local Docker
+storage. It has not been revalidated against current WRC pages because the bounded source
+recheck returned an empty response. The parser requires the observed content/wrapper signals
+and rejects multiple page titles; when a page title is absent, it uses the validated metadata
+identifier. A future source-layout change will fail for review rather than silently storing
+incomplete legal text. Wrapper output preserves source-link provenance; it does not rewrite
+links to transformed object URLs.
+
 ### Immutable storage and its limits
 
 `ObjectStore.put_if_absent` uses `If-None-Match: *`, then reads and hashes the exact stored
@@ -304,8 +353,9 @@ uv pip check --python .venv/Scripts/python.exe --cache-dir .uv-cache
 
 Default tests use synthetic inputs with DNS/socket access blocked; storage integration
 tests are skipped unless `--storage` is supplied. Dependency/import checks do not prove
-service behavior. The opt-in checks exercise local storage and a fixed immutable ingestion
-asset; no test proves current positive live scraping or the complete transformation pipeline.
+service behavior. The opt-in checks exercise local storage, fixed immutable ingestion assets
+and the standalone transformation CLI; no test proves current positive live scraping or an
+orchestrated end-to-end run.
 
 ## Design decisions and constraints
 
@@ -320,8 +370,8 @@ asset; no test proves current positive live scraping or the complete transformat
 - `published_date` keeps the assignment's name, but denotes the website's displayed
   decision/determination date. It is not an inferred true publication timestamp.
 - Encode unsafe output filename characters reversibly, preserving the original identifier.
-  Landing paths separate logical records, assets and exact byte hashes; transformed
-  `identifier.ext` paths remain future work.
+  Landing paths separate logical records, assets and exact byte hashes. Transformed paths use
+  the encoded `identifier.ext` basename beneath collision-safe provenance directories.
 
 ## Freshness limitations
 
