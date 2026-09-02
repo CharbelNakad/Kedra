@@ -178,9 +178,11 @@ JSON Lines events distinguish downloads, storage outcomes and failures. The fina
 `ingestion_run_summary` reconciles available/failed records, downloaded/stored files,
 validator-backed `not_modified_files`, new/reused objects and metadata versions, and failed
 asset URLs. Malformed cards and conflicting cards that share a logical identity count as
-failed documents even though they cannot become separate metadata records. Validator-state,
-Landing-metadata and object-verification preflight failures retain a specific storage-stage
-reason instead of appearing as network failures. Successful records are divided into
+failed documents even though they cannot become separate metadata records. Records known to
+be missing because pagination stopped before an advertised total are also failed documents;
+their individual URLs remain unknown because their listing cards were never received.
+Validator-state, Landing-metadata and object-verification preflight failures retain a
+specific storage-stage reason instead of appearing as network failures. Successful records are divided into
 `records_with_downloads` and
 `records_reused_without_download`; an identical object found only after receiving a 200 body
 stays in the former category. Exit code 0 requires both complete listing enumeration and
@@ -225,13 +227,31 @@ Get-Content .local/transform.env | ForEach-Object {
     [Environment]::SetEnvironmentVariable($name, $value, 'Process')
 }
 .\.venv\Scripts\python.exe -m kedra transform --config config.example.toml `
-  --start-date 2025-07-17 --end-date 2025-07-17
+  --start-date 2025-07-17 --end-date 2025-07-17 `
+  --ingestion-manifest .local/ingestion-2025-07-17.jsonl
 ```
+
+The manifest is the complete JSONL output from the matching ingestion command. Save it under
+ignored `.local/` storage when running ingestion:
+
+```powershell
+$manifestPath = '.local/ingestion-2025-07-17.jsonl'
+.\.venv\Scripts\python.exe -m kedra ingest --config config.example.toml `
+  --start-date 2025-07-17 --end-date 2025-07-17 --body-id 15376 > $manifestPath
+if ($LASTEXITCODE -ne 0) { throw 'Ingestion did not complete; inspect the JSONL manifest.' }
+```
+
+The transform command requires one run ID, a final `ingestion_run_summary`, matching source,
+dates and configured body IDs, complete discovery/document stages, no failed or pending work,
+and one valid Landing version ID for every `asset_stored` event. An incomplete, mixed,
+malformed or mismatched manifest returns an incomplete transformation summary before storage
+is opened. A complete zero-result ingestion is allowed to transform zero assets; an arbitrary
+empty date query without a completed manifest is not.
 
 Both dates are inclusive and refer to the source's displayed decision/determination date.
 The command queries indexed Landing metadata in MongoDB, follows the stored object keys and
-does not access the WRC website. It selects every immutable Landing asset version in range;
-the future orchestrated path will narrow that boundary with a completed ingestion manifest.
+does not access the WRC website. It transforms exactly the manifest's immutable Landing
+versions after confirming that each is present in the requested date/source/body scope.
 
 PDF, DOC and DOCX bytes are copied exactly. HTML is parsed with BeautifulSoup into a stable
 UTF-8 document containing the `h1.page-title` identifier and the single `.content` decision
@@ -248,12 +268,13 @@ The separate transformed Mongo collection records the new path/hash and the exac
 object/hash it came from. HTML receives a new SHA-256 over its cleaned bytes; binary hashes
 remain equal because the bytes are unchanged.
 
-JSON Lines events report each success or failure and reconcile selected, transformed, failed,
-HTML, binary, created and reused counts. Exit code 0 means every selected asset succeeded; 3
-means one or more assets failed or the storage query was unavailable. Successful outputs are
-kept when another asset fails. Rerunning reuses matching output objects and metadata. As with
-Landing ingestion, an interruption after object creation is recovered by completing metadata
-on the next run; no source or Landing data is updated, renamed or deleted.
+JSON Lines events carry the ingestion run ID, report each success or failure and reconcile
+selected, transformed, failed, HTML, binary, created and reused counts. Exit code 0 means the
+manifest was complete and every selected asset succeeded; 3 means the manifest, selected
+Landing state, an asset or storage failed. Successful outputs are kept when another asset
+fails. Rerunning reuses matching output objects and metadata. As with Landing ingestion, an
+interruption after object creation is recovered by completing metadata on the next run; no
+source or Landing data is updated, renamed or deleted.
 
 The extraction contract is verified against controlled HTML fixtures and local Docker
 storage. It has not been revalidated against current WRC pages because the bounded source

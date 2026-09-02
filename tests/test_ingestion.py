@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import zipfile
 from dataclasses import replace
 from datetime import date
@@ -29,6 +30,7 @@ from kedra.ingestion import (
 )
 from kedra.models import RecordMetadata
 from kedra.storage import ObjectNotFound, StorageError, StoredObject
+from kedra.transformation import load_ingestion_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "config.example.toml"
@@ -522,7 +524,7 @@ def test_failed_attachment_is_correlated_and_prevents_record_success(example_env
     assert events[-1]["failure_stage"] == "download"
 
 
-def test_complete_fixture_ingestion_reconciles_one_record_and_one_asset(example_env):
+def test_complete_fixture_ingestion_reconciles_one_record_and_one_asset(example_env, tmp_path):
     events = []
     spider = ingestion_spider(example_env, events)
     listing_request = next(spider.initial_requests())
@@ -562,7 +564,11 @@ def test_complete_fixture_ingestion_reconciles_one_record_and_one_asset(example_
     spider.closed("finished")
 
     run = events[-1]
+    stored_event = next(event for event in events if event["event"] == "asset_stored")
+    assert stored_event["landing_version_id"] == next(iter(service.metadata_store.documents))
     assert run["event"] == "ingestion_run_summary"
+    assert run["start_date"] == run["end_date"] == "2025-07-17"
+    assert run["body_ids"] == ["15376"]
     assert run["discovery_complete"] is True
     assert run["successfully_available_records"] == 1
     assert run["records_with_downloads"] == 1
@@ -571,6 +577,20 @@ def test_complete_fixture_ingestion_reconciles_one_record_and_one_asset(example_
     assert run["downloaded_files"] == run["stored_files"] == 1
     assert run["created_objects"] == run["inserted_metadata_versions"] == 1
     assert run["complete"] is True
+    manifest_path = tmp_path / "ingestion.jsonl"
+    manifest_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    manifest = load_ingestion_manifest(
+        manifest_path,
+        date(2025, 7, 17),
+        date(2025, 7, 17),
+        "workplace-relations",
+        ("15376",),
+    )
+    assert manifest.run_id == spider.run_id
+    assert manifest.landing_version_ids == (stored_event["landing_version_id"],)
 
 
 def test_malformed_listing_card_is_included_in_failed_document_count(example_env):
@@ -600,6 +620,65 @@ def test_malformed_listing_card_is_included_in_failed_document_count(example_env
     assert run["ingestion_records"] == 1
     assert run["successfully_available_records"] == 0
     assert run["failed_documents"] == 1
+    assert run["complete"] is False
+
+
+def test_known_missing_pagination_records_are_failed_documents(example_env):
+    loaded = load_settings(EXAMPLE, example_env)
+    settings = replace(
+        loaded,
+        scraping=replace(
+            loaded.scraping,
+            partition_size="day",
+            max_pages_per_partition=1,
+        ),
+    )
+    events = []
+    spider = DecisionsIngestionSpider(
+        settings,
+        DateRange.from_inputs("2025-07-17", "2025-07-17"),
+        body_ids=["15376"],
+        event_sink=events.append,
+    )
+    listing_request = next(spider.initial_requests())
+    outputs = list(
+        spider.parse_listing(
+            HtmlResponse(
+                listing_request.url,
+                body=(ROOT / "tests/fixtures/search/body-15376-page-1.html").read_bytes(),
+                encoding="utf-8",
+                request=listing_request,
+            ),
+            listing_request.cb_kwargs["unit_key"],
+        )
+    )
+    document_requests = [item for item in outputs if isinstance(item, Request)]
+    service = LandingAssetService(MemoryObjectStore(), MemoryMetadataStore(), "workplace-relations")
+    for request in document_requests:
+        asset = next(
+            item
+            for item in spider.parse_asset(
+                http_response(
+                    request.url,
+                    b"<html><body><div class='content'>Decision text.</div></body></html>",
+                    media_type="text/html",
+                ),
+                **request.cb_kwargs,
+            )
+            if isinstance(item, DownloadedAsset)
+        )
+        spider.asset_persisted(asset, service.persist(asset))
+
+    spider.closed("finished")
+
+    run = events[-1]
+    assert len(document_requests) == 10
+    assert run["advertised_total"] == 12
+    assert run["card_occurrences"] == 10
+    assert run["known_missing_records"] == 2
+    assert run["ingestion_records"] == 12
+    assert run["successfully_available_records"] == 10
+    assert run["failed_documents"] == 2
     assert run["complete"] is False
 
 

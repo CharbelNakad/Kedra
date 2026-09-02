@@ -7,6 +7,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from html import escape
+from pathlib import Path
 from typing import Any, TextIO
 from urllib.parse import urljoin
 from uuid import uuid4
@@ -46,6 +47,139 @@ class TransformationError(RuntimeError):
         super().__init__(reason)
         self.reason = reason
         self.output_object = output_object
+
+
+class ManifestError(RuntimeError):
+    """An ingestion log cannot prove that its run completed successfully."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class IngestionManifest:
+    """Validated handoff from one complete ingestion run."""
+
+    run_id: str
+    source: str
+    start_date: date
+    end_date: date
+    body_ids: tuple[str, ...]
+    landing_version_ids: tuple[str, ...]
+    successfully_available_records: int
+
+
+def _manifest_error(reason: str) -> ManifestError:
+    return ManifestError(reason)
+
+
+def load_ingestion_manifest(
+    path: Path,
+    expected_start_date: date,
+    expected_end_date: date,
+    expected_source: str,
+    configured_body_ids: Sequence[str],
+) -> IngestionManifest:
+    """Validate a JSONL ingestion log as an exact transformation handoff."""
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        raise _manifest_error("ingestion_manifest_unreadable") from None
+    try:
+        events = [json.loads(line) for line in lines if line.strip()]
+    except (json.JSONDecodeError, UnicodeError):
+        raise _manifest_error("invalid_ingestion_manifest") from None
+    if not events or any(not isinstance(event, dict) for event in events):
+        raise _manifest_error("invalid_ingestion_manifest")
+    run_ids = {event.get("run_id") for event in events}
+    if len(run_ids) != 1:
+        raise _manifest_error("ingestion_manifest_mixed_runs")
+    run_id = run_ids.pop()
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise _manifest_error("invalid_ingestion_manifest")
+    summaries = [event for event in events if event.get("event") == "ingestion_run_summary"]
+    if len(summaries) != 1 or events[-1] is not summaries[0]:
+        raise _manifest_error("invalid_ingestion_manifest")
+    summary = summaries[0]
+    if not (
+        summary.get("complete") is True
+        and summary.get("discovery_complete") is True
+        and summary.get("document_stage") == "complete"
+        and summary.get("failed_documents") == 0
+        and summary.get("incomplete_asset_operations") == 0
+        and summary.get("partitions_with_unknown_missing_count") == 0
+    ):
+        raise _manifest_error("ingestion_manifest_incomplete")
+    if (
+        summary.get("source") != expected_source
+        or summary.get("start_date") != expected_start_date.isoformat()
+        or summary.get("end_date") != expected_end_date.isoformat()
+    ):
+        raise _manifest_error("ingestion_manifest_scope_mismatch")
+    body_ids = summary.get("body_ids")
+    if (
+        not isinstance(body_ids, list)
+        or not body_ids
+        or any(not isinstance(body_id, str) or not body_id for body_id in body_ids)
+        or len(set(body_ids)) != len(body_ids)
+        or any(body_id not in configured_body_ids for body_id in body_ids)
+    ):
+        raise _manifest_error("invalid_ingestion_manifest")
+    stored_files = summary.get("stored_files")
+    successful_records = summary.get("successfully_available_records")
+    if (
+        type(stored_files) is not int
+        or stored_files < 0
+        or type(successful_records) is not int
+        or successful_records < 0
+    ):
+        raise _manifest_error("invalid_ingestion_manifest")
+    stored_events = [event for event in events if event.get("event") == "asset_stored"]
+    version_ids = tuple(event.get("landing_version_id") for event in stored_events)
+    if (
+        len(stored_events) != stored_files
+        or any(
+            not isinstance(version_id, str) or not SHA256.fullmatch(version_id)
+            for version_id in version_ids
+        )
+        or len(set(version_ids)) != len(version_ids)
+        or any(
+            event.get("source") != expected_source or event.get("body_id") not in body_ids
+            for event in stored_events
+        )
+        or (successful_records == 0) != (stored_files == 0)
+        or stored_files < successful_records
+    ):
+        raise _manifest_error("invalid_ingestion_manifest")
+    return IngestionManifest(
+        run_id,
+        expected_source,
+        expected_start_date,
+        expected_end_date,
+        tuple(body_ids),
+        version_ids,
+        successful_records,
+    )
+
+
+def select_manifest_documents(
+    documents: Sequence[Mapping[str, Any]], manifest: IngestionManifest
+) -> list[Mapping[str, Any]]:
+    """Select exactly the complete run's versions from its already date-bounded Mongo query."""
+    by_id = {document.get("_id"): document for document in documents}
+    selected = []
+    for version_id in manifest.landing_version_ids:
+        document = by_id.get(version_id)
+        if document is None:
+            raise _manifest_error("ingestion_manifest_landing_version_missing")
+        if (
+            document.get("source") != manifest.source
+            or document.get("body_id") not in manifest.body_ids
+        ):
+            raise _manifest_error("ingestion_manifest_scope_mismatch")
+        selected.append(document)
+    return selected
 
 
 def _required_text(document: Mapping[str, Any], name: str) -> str:
@@ -420,17 +554,19 @@ def transform_documents(
     end_date: date,
     *,
     run_id: str | None = None,
+    ingestion_run_id: str | None = None,
 ) -> int:
     active_run_id = run_id or uuid4().hex
 
     def emit(event: dict[str, Any]) -> None:
-        event_sink(
-            {
-                "run_id": active_run_id,
-                "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                **event,
-            }
-        )
+        envelope = {
+            "run_id": active_run_id,
+            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            **event,
+        }
+        if ingestion_run_id is not None:
+            envelope["ingestion_run_id"] = ingestion_run_id
+        event_sink(envelope)
 
     emit(
         {
@@ -531,6 +667,7 @@ def transform_documents(
 def run_transformation(
     settings: Settings,
     date_range: DateRange,
+    manifest_path: Path,
     stream: TextIO,
 ) -> int:
     """Run the standalone storage-to-storage transformation without source HTTP access."""
@@ -541,6 +678,39 @@ def run_transformation(
         stream.flush()
 
     end_date = date_range.end_exclusive - timedelta(days=1)
+    try:
+        manifest = load_ingestion_manifest(
+            manifest_path,
+            date_range.start,
+            end_date,
+            settings.source.name,
+            settings.source.body_ids,
+        )
+    except ManifestError as error:
+        write(
+            {
+                "run_id": run_id,
+                "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "event": "transformation_run_summary",
+                "start_date": date_range.start.isoformat(),
+                "end_date": end_date.isoformat(),
+                "transform_version": TRANSFORM_VERSION,
+                "selected_assets": None,
+                "successfully_transformed_assets": 0,
+                "failed_assets": None,
+                "html_transformed": 0,
+                "binary_copied": 0,
+                "created_objects": 0,
+                "reused_objects": 0,
+                "inserted_metadata_versions": 0,
+                "reused_metadata_versions": 0,
+                "failed_landing_version_ids": [],
+                "failure_reasons": [error.reason],
+                "complete": False,
+                "reason": error.reason,
+            }
+        )
+        return 3
     try:
         with mongo_client(settings.storage) as mongo, closing(s3_client(settings.storage)) as s3:
             database = mongo[settings.storage.mongo_database]
@@ -560,7 +730,8 @@ def run_transformation(
             transformed_metadata = TransformedMetadataStore(
                 database[settings.storage.transformed_collection], transformed_objects
             )
-            documents = landing_metadata.find_published_between(date_range.start, end_date)
+            date_documents = landing_metadata.find_published_between(date_range.start, end_date)
+            documents = select_manifest_documents(date_documents, manifest)
             service = TransformationService(
                 landing_objects,
                 transformed_objects,
@@ -575,11 +746,18 @@ def run_transformation(
                 date_range.start,
                 end_date,
                 run_id=run_id,
+                ingestion_run_id=manifest.run_id,
             )
-    except StorageError:
+    except (ManifestError, StorageError) as error:
+        reason = (
+            error.reason
+            if isinstance(error, ManifestError)
+            else "landing_metadata_query_or_storage_failure"
+        )
         write(
             {
                 "run_id": run_id,
+                "ingestion_run_id": manifest.run_id,
                 "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "event": "transformation_run_summary",
                 "start_date": date_range.start.isoformat(),
@@ -595,9 +773,9 @@ def run_transformation(
                 "inserted_metadata_versions": 0,
                 "reused_metadata_versions": 0,
                 "failed_landing_version_ids": [],
-                "failure_reasons": ["landing_metadata_query_or_storage_failure"],
+                "failure_reasons": [reason],
                 "complete": False,
-                "reason": "landing_metadata_query_or_storage_failure",
+                "reason": reason,
             }
         )
         return 3

@@ -812,6 +812,7 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
                 "body_id": asset.record.body_id,
                 "partition_date": asset.record.partition_date.isoformat(),
                 "record_key": asset.record.record_key,
+                "landing_version_id": result.version.version_id,
                 "asset_id": asset.asset_id,
                 "asset_role": asset.role,
                 "source_url": asset.source_url,
@@ -846,7 +847,12 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
         successful = sum(state.complete for state in states)
         malformed_records = sum(summary.malformed_cards for summary in self.summaries.values())
         collision_records = sum(summary.identity_collisions for summary in self.summaries.values())
-        document_candidates = len(states) + malformed_records + collision_records
+        known_missing_records = sum(
+            summary.known_missing_records or 0 for summary in self.summaries.values()
+        )
+        document_candidates = (
+            len(states) + malformed_records + collision_records + known_missing_records
+        )
         records_reused_without_download = sum(
             state.complete and state.downloaded_assets == 0 for state in states
         )

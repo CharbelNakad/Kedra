@@ -18,7 +18,7 @@ pytestmark = pytest.mark.storage
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = ROOT / "config.example.toml"
-SOURCE = "synthetic-transform-check"
+SOURCE = "workplace-relations"
 INSIDE_START = date(2099, 1, 2)
 INSIDE_END = date(2099, 1, 4)
 OUTSIDE = date(2099, 1, 5)
@@ -104,7 +104,45 @@ def fixed_assets():
     ]
 
 
-def run_cli(settings):
+def write_ingestion_manifest(path, versions):
+    run_id = "fixed-complete-transformation-ingestion"
+    events = [
+        {
+            "event": "asset_stored",
+            "run_id": run_id,
+            "source": SOURCE,
+            "body_id": version.record.body_id,
+            "landing_version_id": version.version_id,
+        }
+        for version in versions
+    ]
+    events.append(
+        {
+            "event": "ingestion_run_summary",
+            "run_id": run_id,
+            "source": SOURCE,
+            "start_date": INSIDE_START.isoformat(),
+            "end_date": INSIDE_END.isoformat(),
+            "body_ids": ["2"],
+            "complete": True,
+            "discovery_complete": True,
+            "document_stage": "complete",
+            "failed_documents": 0,
+            "incomplete_asset_operations": 0,
+            "partitions_with_unknown_missing_count": 0,
+            "stored_files": len(versions),
+            "successfully_available_records": len(
+                {version.record.record_key for version in versions}
+            ),
+        }
+    )
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+def run_cli(settings, manifest_path):
     environment = os.environ.copy()
     environment.update(
         {
@@ -127,6 +165,8 @@ def run_cli(settings):
             INSIDE_START.isoformat(),
             "--end-date",
             INSIDE_END.isoformat(),
+            "--ingestion-manifest",
+            str(manifest_path),
         ],
         cwd=ROOT,
         env=environment,
@@ -148,7 +188,7 @@ def transformed_snapshot(database, collection_name, landing_ids):
     return {document["landing_version_id"]: document for document in documents}
 
 
-def test_transform_cli_is_date_bounded_idempotent_and_leaves_landing_unchanged(stores):
+def test_transform_cli_is_manifest_gated_idempotent_and_leaves_landing_unchanged(stores, tmp_path):
     ingest_settings, database, _, landing_metadata, landing_objects = stores
     assets = fixed_assets()
     service = LandingAssetService(
@@ -171,8 +211,10 @@ def test_transform_cli_is_date_bounded_idempotent_and_leaves_landing_unchanged(s
         for version in versions
     }
     transform_settings = local_settings(EXAMPLE, "transform")
+    manifest_path = tmp_path / "complete-ingestion.jsonl"
+    write_ingestion_manifest(manifest_path, inside_versions)
 
-    first, first_summary = run_cli(transform_settings)
+    first, first_summary = run_cli(transform_settings, manifest_path)
     with mongo_client(transform_settings) as mongo, closing(s3_client(transform_settings)) as s3:
         transform_database = mongo[transform_settings.mongo_database]
         first_outputs = transformed_snapshot(
@@ -189,7 +231,7 @@ def test_transform_cli_is_date_bounded_idempotent_and_leaves_landing_unchanged(s
             landing_id: transformed_objects.read(document["object_key"], document["file_hash"])
             for landing_id, document in first_outputs.items()
         }
-        second, second_summary = run_cli(transform_settings)
+        second, second_summary = run_cli(transform_settings, manifest_path)
         second_outputs = transformed_snapshot(
             transform_database,
             transform_settings.transformed_collection,
@@ -219,6 +261,7 @@ def test_transform_cli_is_date_bounded_idempotent_and_leaves_landing_unchanged(s
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
     assert first_summary["selected_assets"] == len(inside_versions) == 4
+    assert first_summary["ingestion_run_id"] == "fixed-complete-transformation-ingestion"
     assert first_summary["successfully_transformed_assets"] == 4
     assert first_summary["html_transformed"] == 2
     assert first_summary["binary_copied"] == 2

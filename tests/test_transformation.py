@@ -1,13 +1,17 @@
 import hashlib
+import io
+import json
 from copy import deepcopy
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from bs4 import BeautifulSoup
 from pymongo.errors import DuplicateKeyError
 
+from kedra.dates import DateRange
 from kedra.models import RecordMetadata
 from kedra.storage import (
     IntegrityError,
@@ -17,10 +21,15 @@ from kedra.storage import (
     StoredObject,
 )
 from kedra.transformation import (
+    IngestionManifest,
     LandingAsset,
+    ManifestError,
     TransformationError,
     TransformationService,
     TransformedMetadataStore,
+    load_ingestion_manifest,
+    run_transformation,
+    select_manifest_documents,
     transform_documents,
     transform_html,
 )
@@ -137,6 +146,137 @@ def service_for(*fixtures):
         PREFIX,
     )
     return service, landing, transformed, metadata
+
+
+def write_manifest(path, version_ids, *, complete=True):
+    run_id = "complete-ingestion-run"
+    events = [
+        {
+            "event": "asset_stored",
+            "run_id": run_id,
+            "source": "workplace-relations",
+            "body_id": "15376",
+            "landing_version_id": version_id,
+        }
+        for version_id in version_ids
+    ]
+    events.append(
+        {
+            "event": "ingestion_run_summary",
+            "run_id": run_id,
+            "source": "workplace-relations",
+            "start_date": "2025-07-17",
+            "end_date": "2025-07-17",
+            "body_ids": ["15376"],
+            "complete": complete,
+            "discovery_complete": complete,
+            "document_stage": "complete" if complete else "incomplete",
+            "failed_documents": 0 if complete else 1,
+            "incomplete_asset_operations": 0,
+            "partitions_with_unknown_missing_count": 0,
+            "stored_files": len(version_ids),
+            "successfully_available_records": len(version_ids),
+        }
+    )
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+def test_complete_ingestion_manifest_selects_exact_versions_and_binds_scope(tmp_path):
+    first = landing_fixture(b"%PDF-1.4\nfirst manifest fixture", "pdf")
+    second = landing_fixture(
+        b"%PDF-1.4\nsecond manifest fixture",
+        "pdf",
+        reference="ADJ-00054322",
+        title="ADJ-00054322",
+    )
+    manifest_path = tmp_path / "ingestion.jsonl"
+    write_manifest(manifest_path, [first[0]["_id"]])
+
+    manifest = load_ingestion_manifest(
+        manifest_path,
+        date(2025, 7, 17),
+        date(2025, 7, 17),
+        "workplace-relations",
+        ("15376",),
+    )
+
+    assert manifest.run_id == "complete-ingestion-run"
+    assert manifest.landing_version_ids == (first[0]["_id"],)
+    assert select_manifest_documents([first[0], second[0]], manifest) == [first[0]]
+
+
+def test_complete_zero_result_manifest_is_valid_but_an_incomplete_run_is_not(tmp_path):
+    empty_path = tmp_path / "empty.jsonl"
+    write_manifest(empty_path, [])
+    empty = load_ingestion_manifest(
+        empty_path,
+        date(2025, 7, 17),
+        date(2025, 7, 17),
+        "workplace-relations",
+        ("15376",),
+    )
+    assert empty.landing_version_ids == ()
+
+    incomplete_path = tmp_path / "incomplete.jsonl"
+    write_manifest(incomplete_path, [], complete=False)
+    with pytest.raises(ManifestError, match="ingestion_manifest_incomplete"):
+        load_ingestion_manifest(
+            incomplete_path,
+            date(2025, 7, 17),
+            date(2025, 7, 17),
+            "workplace-relations",
+            ("15376",),
+        )
+
+
+def test_standalone_transform_rejects_incomplete_manifest_before_storage_access(tmp_path):
+    manifest_path = tmp_path / "incomplete.jsonl"
+    write_manifest(manifest_path, [], complete=False)
+    settings = SimpleNamespace(
+        source=SimpleNamespace(name="workplace-relations", body_ids=("15376",))
+    )
+    stream = io.StringIO()
+
+    exit_code = run_transformation(
+        settings,
+        DateRange.from_inputs("2025-07-17", "2025-07-17"),
+        manifest_path,
+        stream,
+    )
+
+    summary = json.loads(stream.getvalue())
+    assert exit_code == 3
+    assert summary["event"] == "transformation_run_summary"
+    assert summary["reason"] == "ingestion_manifest_incomplete"
+    assert summary["complete"] is False
+
+
+def test_manifest_rejects_date_mismatch_and_missing_landing_version(tmp_path):
+    version_id = "a" * 64
+    manifest_path = tmp_path / "ingestion.jsonl"
+    write_manifest(manifest_path, [version_id])
+    with pytest.raises(ManifestError, match="ingestion_manifest_scope_mismatch"):
+        load_ingestion_manifest(
+            manifest_path,
+            date(2025, 7, 16),
+            date(2025, 7, 17),
+            "workplace-relations",
+            ("15376",),
+        )
+    manifest = IngestionManifest(
+        "run",
+        "workplace-relations",
+        date(2025, 7, 17),
+        date(2025, 7, 17),
+        ("15376",),
+        (version_id,),
+        1,
+    )
+    with pytest.raises(ManifestError, match="ingestion_manifest_landing_version_missing"):
+        select_manifest_documents([], manifest)
 
 
 def test_html_transform_keeps_complete_legal_region_and_removes_site_chrome():

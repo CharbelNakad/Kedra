@@ -159,14 +159,21 @@ def test_ingest_cli_passes_validated_scope_to_scrapy(monkeypatch, capsys, exampl
 
 
 def test_transform_cli_passes_validated_date_range_to_standalone_runner(
-    monkeypatch, capsys, example_env
+    monkeypatch, capsys, example_env, tmp_path
 ):
     for name, value in example_env.items():
         monkeypatch.setenv(name, value)
     captured = {}
 
-    def fake_run(settings, date_range, stream):
-        captured.update(settings=settings, date_range=date_range, stream=stream)
+    manifest = tmp_path / "ingestion.jsonl"
+
+    def fake_run(settings, date_range, manifest_path, stream):
+        captured.update(
+            settings=settings,
+            date_range=date_range,
+            manifest_path=manifest_path,
+            stream=stream,
+        )
         return 3
 
     monkeypatch.setattr("kedra.cli.run_transformation", fake_run)
@@ -179,6 +186,8 @@ def test_transform_cli_passes_validated_date_range_to_standalone_runner(
             "2025-07-17",
             "--end-date",
             "2025-07-18",
+            "--ingestion-manifest",
+            str(manifest),
         ]
     )
 
@@ -186,8 +195,25 @@ def test_transform_cli_passes_validated_date_range_to_standalone_runner(
     assert captured["date_range"].start.isoformat() == "2025-07-17"
     assert captured["date_range"].end_exclusive.isoformat() == "2025-07-19"
     assert captured["settings"].storage.transformed_bucket == "kedra-transformed"
+    assert captured["manifest_path"] == manifest
     assert captured["stream"] is not None
     assert capsys.readouterr().err == ""
+
+
+def test_transform_cli_requires_completed_ingestion_manifest():
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "transform",
+                "--config",
+                EXAMPLE,
+                "--start-date",
+                "2030-01-01",
+                "--end-date",
+                "2030-01-01",
+            ]
+        )
+    assert error.value.code == 2
 
 
 @pytest.mark.parametrize("command", ["discover", "ingest"])

@@ -52,6 +52,12 @@ def main(argv: list[str] | None = None) -> int:
     transform.add_argument("--config", required=True, type=Path)
     transform.add_argument("--start-date", required=True, help="inclusive YYYY-MM-DD")
     transform.add_argument("--end-date", required=True, help="inclusive YYYY-MM-DD")
+    transform.add_argument(
+        "--ingestion-manifest",
+        required=True,
+        type=Path,
+        help="JSONL output from a complete ingestion run over the same scope",
+    )
     args = parser.parse_args(argv)
     try:
         date_range = DateRange.from_inputs(args.start_date, args.end_date)
@@ -65,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
             runner = run_discovery if args.command == "discover" else run_ingestion
             return runner(settings, date_range, args.body_ids, sys.stdout)
         if args.command == "transform":
-            return run_transformation(settings, date_range, sys.stdout)
+            return run_transformation(settings, date_range, args.ingestion_manifest, sys.stdout)
         count = 0
         preview = []
         last_label = None

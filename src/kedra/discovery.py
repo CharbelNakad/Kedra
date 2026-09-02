@@ -8,7 +8,7 @@ import re
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any, TextIO
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
@@ -834,6 +834,9 @@ class DecisionsDiscoverySpider(scrapy.Spider):
             {
                 "event": self._run_summary_event(),
                 "source": self.app_settings.source.name,
+                "start_date": self.date_range.start.isoformat(),
+                "end_date": (self.date_range.end_exclusive - timedelta(days=1)).isoformat(),
+                "body_ids": list(self.body_ids),
                 "body_partition_count": len(self.trackers),
                 "complete_partitions": sum(summary.complete for summary in summaries),
                 "incomplete_partitions": sum(not summary.complete for summary in summaries),
