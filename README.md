@@ -161,10 +161,11 @@ small body/date scope:
 The command recognizes HTML, PDF, DOC and DOCX using byte signatures together with MIME and
 the final URL. It saves complete response bytes without cleaning or conversion. HTML pages
 must contain substantive `.content` or an explicit decision asset. Empty wrapper pages are
-preserved and only `.related-file a.download`, `.attachments a.download`, or explicitly
-marked `data-document-asset` links are followed. Preview images, general navigation and
-off-host links are excluded. Every wrapper attachment or continuation is required for that
-record to succeed.
+preserved. Observed `.related-file a.download`/`.attachments a.download` assets, explicitly
+marked `data-document-asset` links, and semantic `a.next`/`rel="next"` links inside the
+decision content region are followed. Preview images, general navigation and off-host links
+are excluded. Every wrapper attachment or continuation is required for that record to
+succeed.
 
 Each object key contains the logical record key, stable asset ID, exact SHA-256 and detected
 format. The create-only object write is read back and verified before its Mongo metadata is
@@ -175,8 +176,11 @@ Mongo/S3 work is serialized in Scrapy's thread pool, outside the reactor thread.
 JSON Lines events distinguish downloads, storage outcomes and failures. The final
 `ingestion_run_summary` reconciles available/failed records, downloaded/stored files,
 validator-backed `not_modified_files`, new/reused objects and metadata versions, and failed
-asset URLs. Malformed listing cards count as failed documents even though they cannot become
-metadata records. Successful records are divided into `records_with_downloads` and
+asset URLs. Malformed cards and conflicting cards that share a logical identity count as
+failed documents even though they cannot become separate metadata records. Validator-state,
+Landing-metadata and object-verification preflight failures retain a specific storage-stage
+reason instead of appearing as network failures. Successful records are divided into
+`records_with_downloads` and
 `records_reused_without_download`; an identical object found only after receiving a 200 body
 stays in the former category. Exit code 0 requires both complete listing enumeration and
 every required asset; incomplete work returns 3.
@@ -194,6 +198,13 @@ partition labels and query windows. An overlapping daily/monthly check therefore
 same source version. A listing-only metadata correction creates another metadata version
 around the verified existing object. Equal content length is never equality evidence:
 same-length binary edits and HTML timing-comment edits retain separate raw versions.
+
+Redirect destinations and MIME headers are transport observations, not content-version
+identity. If the requested asset, source metadata, detected format and exact bytes are equal,
+their change alone does not create a duplicate Landing version. The first observation stays
+in immutable metadata and every `asset_stored` event reports the current final URL and MIME.
+Consumers that need an immutable history of transport-only changes would need a separate
+append-only observation log; the Landing content model does not provide that history.
 
 The public source returned a zero-byte HTTP 200 during the bounded source recheck, so this
 command has not received a positive current live-source validation and must not be used to

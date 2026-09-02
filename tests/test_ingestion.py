@@ -28,7 +28,7 @@ from kedra.ingestion import (
     validator_state_id,
 )
 from kedra.models import RecordMetadata
-from kedra.storage import ObjectNotFound, StoredObject
+from kedra.storage import ObjectNotFound, StorageError, StoredObject
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "config.example.toml"
@@ -148,6 +148,23 @@ def test_html_inspection_keeps_only_explicit_assets_and_excludes_preview_images(
     assert [(link.role, link.url) for link in links] == [
         ("attachment", f"https://{SOURCE_HOST}/asset.pdf"),
         ("continuation", f"https://{SOURCE_HOST}/part-2.html"),
+    ]
+
+
+def test_semantic_next_link_inside_decision_content_is_a_required_continuation():
+    response = http_response(
+        SOURCE_URL,
+        b"""<html><body><div class="content">
+        <p>Decision page one.</p><a class="next" href="/part-2.html">Next</a>
+        </div></body></html>""",
+        media_type="text/html",
+    )
+
+    has_content, links = inspect_html(response)
+
+    assert has_content is True
+    assert [(link.role, link.url) for link in links] == [
+        ("continuation", f"https://{SOURCE_HOST}/part-2.html")
     ]
 
 
@@ -586,6 +603,57 @@ def test_malformed_listing_card_is_included_in_failed_document_count(example_env
     assert run["complete"] is False
 
 
+def test_identity_collision_is_included_in_failed_document_count(example_env):
+    events = []
+    spider = ingestion_spider(example_env, events)
+    listing_request = next(spider.initial_requests())
+    listing_body = f"""<html><body><p class="results-count">2 results found</p>
+    <li class="each-item"><h2 class="title">ADJ-00050000</h2>
+    <p class="description">Original card.</p>
+    <span class="date">17/07/2025</span><span class="refNO">ADJ-00050000</span>
+    <div class="link"><a href="{SOURCE_URL}">View</a></div></li>
+    <li class="each-item"><h2 class="title">Conflicting title</h2>
+    <p class="description">Conflicting card.</p>
+    <span class="date">17/07/2025</span><span class="refNO">ADJ-00050000</span>
+    <div class="link"><a href="https://{SOURCE_HOST}/en/cases/conflict.html">View</a></div></li>
+    </body></html>""".encode()
+    outputs = list(
+        spider.parse_listing(
+            HtmlResponse(
+                listing_request.url,
+                body=listing_body,
+                encoding="utf-8",
+                request=listing_request,
+            ),
+            listing_request.cb_kwargs["unit_key"],
+        )
+    )
+    document_request = next(item for item in outputs if isinstance(item, Request))
+    asset = next(
+        item
+        for item in spider.parse_asset(
+            http_response(
+                document_request.url,
+                b"%PDF-1.4\ncontrolled collision fixture",
+                media_type="application/pdf",
+            ),
+            **document_request.cb_kwargs,
+        )
+        if isinstance(item, DownloadedAsset)
+    )
+    service = LandingAssetService(MemoryObjectStore(), MemoryMetadataStore(), "workplace-relations")
+    spider.asset_persisted(asset, service.persist(asset))
+
+    spider.closed("finished")
+
+    run = events[-1]
+    assert run["identity_collisions"] == 1
+    assert run["ingestion_records"] == 2
+    assert run["successfully_available_records"] == 1
+    assert run["failed_documents"] == 1
+    assert run["complete"] is False
+
+
 def test_early_close_logs_every_unfinished_asset_url(example_env):
     events = []
     spider = ingestion_spider(example_env, events)
@@ -697,6 +765,44 @@ def test_validator_state_is_not_a_cache_hit_when_the_source_has_no_validator(exa
     assert validator_state_id(asset.record.record_key, asset.source_url) in (
         state_collection.documents
     )
+
+
+def test_validator_state_read_failure_is_reported_as_preflight_storage_failure(
+    monkeypatch, example_env
+):
+    from twisted.internet import defer, threads
+
+    class FailingValidatorStore:
+        def find(self, record_key, source_url):
+            raise StorageError("controlled validator state failure")
+
+    events = []
+    spider = ingestion_spider(example_env, events)
+    spider.asset_service = LandingAssetService(
+        MemoryObjectStore(),
+        MemoryMetadataStore(),
+        "workplace-relations",
+        FailingValidatorStore(),
+    )
+    request = next(spider._accepted_record_outputs(sample_record()))
+
+    def immediate(function, *args, **kwargs):
+        try:
+            return defer.succeed(function(*args, **kwargs))
+        except Exception:
+            return defer.fail()
+
+    monkeypatch.setattr(threads, "deferToThread", immediate)
+    deferred = ConditionalAssetMiddleware().process_request(request, spider)
+    failures = []
+    deferred.addErrback(lambda failure: failures.append(failure))
+    spider.asset_request_failed(SimpleNamespace(request=request, value=failures[0].value))
+
+    state = spider.record_states[sample_record().record_key]
+    assert state.failures[0].reason == "validator_state_read_failed"
+    assert spider.storage_failures == 1
+    assert spider.download_failures == 0
+    assert events[-1]["failure_stage"] == "storage"
 
 
 def test_validator_state_is_not_used_when_its_landing_object_is_missing():

@@ -51,6 +51,14 @@ class AssetError(RuntimeError):
         self.reason = reason
 
 
+class ValidatorPreflightError(StorageError):
+    """A storage read failed before an asset request could be sent."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class AssetLink:
     asset_id: str
@@ -351,6 +359,7 @@ def inspect_html(response: Response) -> tuple[bool, tuple[AssetLink, ...]]:
 
     add(html.css(".related-file a.download, .attachments a.download"), "attachment")
     add(html.css("a[data-document-asset]"), "continuation")
+    add(content.css('a.next, a[rel~="next"]'), "continuation")
     return has_substantive_content, tuple(found.values())
 
 
@@ -429,12 +438,18 @@ class LandingAssetService:
     def find_reusable(self, record_key: str, source_url: str) -> CachedAsset | None:
         if self.validator_store is None:
             return None
-        state = self.validator_store.find(record_key, source_url)
+        try:
+            state = self.validator_store.find(record_key, source_url)
+        except StorageError:
+            raise ValidatorPreflightError("validator_state_read_failed") from None
         if state is None or not (state.get("etag") or state.get("last_modified")):
             return None
         try:
             version_id = state["landing_version_id"]
-            document = self.metadata_store.find(version_id)
+            try:
+                document = self.metadata_store.find(version_id)
+            except StorageError:
+                raise ValidatorPreflightError("validator_metadata_read_failed") from None
             if document is None:
                 return None
             related = tuple(
@@ -469,9 +484,14 @@ class LandingAssetService:
                 or cached.state_id != validator_state_id(record_key, source_url)
             ):
                 return None
-            self.object_store.verify(stored)
+            try:
+                self.object_store.verify(stored)
+            except (ObjectNotFound, IntegrityError):
+                return None
+            except StorageError:
+                raise ValidatorPreflightError("validator_object_verification_failed") from None
             return cached
-        except (KeyError, TypeError, ValueError, ObjectNotFound, IntegrityError):
+        except (KeyError, TypeError, ValueError):
             # Stale or malformed mutable state is a cache miss. A full response can repair it.
             return None
 
@@ -758,7 +778,10 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
         state.pending_requests.pop(values["asset_id"], None)
         response = getattr(failure.value, "response", None)
         status = response.status if response is not None else None
-        reason = "document_http_failure" if response is not None else "document_request_failure"
+        preflight_reason = request.meta.get("kedra_validator_preflight_failure")
+        reason = preflight_reason or (
+            "document_http_failure" if response is not None else "document_request_failure"
+        )
         self._asset_failed(
             state,
             values["asset_id"],
@@ -766,7 +789,7 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
             reason,
             status,
             request.meta.get("retry_times", 0) + 1,
-            storage=False,
+            storage=preflight_reason is not None,
         )
 
     def asset_persisted(
@@ -822,7 +845,8 @@ class DecisionsIngestionSpider(DecisionsDiscoverySpider):
         states = list(self.record_states.values())
         successful = sum(state.complete for state in states)
         malformed_records = sum(summary.malformed_cards for summary in self.summaries.values())
-        document_candidates = len(states) + malformed_records
+        collision_records = sum(summary.identity_collisions for summary in self.summaries.values())
+        document_candidates = len(states) + malformed_records + collision_records
         records_reused_without_download = sum(
             state.complete and state.downloaded_assets == 0 for state in states
         )
@@ -922,7 +946,16 @@ class ConditionalAssetMiddleware:
                 request.headers["If-Modified-Since"] = cached.last_modified
             return None
 
-        deferred.addCallback(apply_validator)
+        def record_preflight_failure(failure):
+            error = failure.value
+            request.meta["kedra_validator_preflight_failure"] = (
+                error.reason
+                if isinstance(error, ValidatorPreflightError)
+                else "validator_preflight_failed"
+            )
+            return failure
+
+        deferred.addCallbacks(apply_validator, record_preflight_failure)
         return deferred
 
 
