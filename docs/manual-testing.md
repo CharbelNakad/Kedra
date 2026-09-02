@@ -297,6 +297,11 @@ walkthrough above separately proves the real Docker storage and permission path.
 
 ## 8. Scrape a bounded Workplace Relations sample
 
+If you are testing only live WRC data, complete steps 1 and 2 first, then skip directly to
+8.1. Steps 3-7 exercise the deterministic local source and the controlled reliability case;
+they are useful separate evidence but are not part of the live scrape. In step 2,
+`config.example.toml` may be used in place of `config.demo.toml` for `prepare` and `bootstrap`.
+
 `config.example.toml` points to the public Workplace Relations search and configures the
 neutral `Kedra/0.1` user-agent that currently receives complete HTML. The earlier user-agent
 containing `discovery` caused a zero-byte HTTP 200. The fix does not impersonate a browser:
@@ -374,17 +379,99 @@ $LiveTransformation = Get-Content $LiveRun.transformation_log_path |
 $LiveRun | Select-Object ingestion_status, transformation_status, complete
 $LiveIngestion | Select-Object advertised_total, distinct_records, `
   successfully_available_records, failed_documents, downloaded_files, stored_files, complete
-$LiveTransformation | Select-Object selected_assets, successful_assets, failed_assets, `
-  html_assets, binary_assets, complete
+$LiveTransformation | Select-Object selected_assets, successfully_transformed_assets, `
+  failed_assets, html_transformed, binary_copied, created_objects, `
+  inserted_metadata_versions, reused_objects, reused_metadata_versions, complete
 ```
 
-Require `complete=True` at all three boundaries. The ingestion count is decisions; the file
-count may be larger when a decision has attachments or continuation pages. Inspect the live
-objects and hashes with the same commands from step 5. Rerunning this exact command is safe:
-it reuses identical immutable versions, uses validators when WRC supplies them and fetches
-validator-free HTML again so freshness is not guessed.
+Require `complete=True` at all three boundaries. For the verified 17 July 2025/body `15376`
+scope, the current result is 12 advertised/distinct/successful decisions, 12 downloaded/stored
+HTML assets, zero failures, and 12 successful HTML transformations. The ingestion count is
+decisions; another scope may have more files when decisions contain attachments or
+continuation pages.
 
-### 8.3 Use an evaluator-supplied range
+### 8.3 Inspect the exact live records, object paths and hashes
+
+Use the ingestion manifest chosen by Dagster rather than guessing which Mongo records belong
+to the run:
+
+```powershell
+$LiveEvents = Get-Content $LiveRun.ingestion_manifest_path | ConvertFrom-Json
+$LiveRecords = $LiveEvents | Where-Object event -eq 'record_discovered'
+$LiveAssets = $LiveEvents | Where-Object event -eq 'asset_stored'
+
+$LiveRecords | Select-Object title, description, reference_number, published_date, `
+  partition_date, source_url | Format-Table -AutoSize
+
+$LiveAssets | Select-Object document_format, asset_role, size_bytes, file_hash, `
+  object_bucket, object_key, landing_version_id, object_created, metadata_created |
+  Format-List
+
+"records=$($LiveRecords.Count) assets=$($LiveAssets.Count)"
+```
+
+Every asset must name `kedra-landing`, have a 64-character SHA-256 `file_hash`, a deterministic
+object key containing that hash, and a nonblank Landing version ID. The verified run reports
+12 records and 12 assets.
+
+Now perform a read-only verification through the restricted transformation role. It reads
+every matching object, recomputes hashes and lengths, validates transformed provenance and
+compares binary outputs byte-for-byte when present:
+
+```powershell
+$LiveInspectionPath = '.local/live-wrc-storage-inspection.jsonl'
+
+& $Python -B scripts/inspect_storage.py `
+  --config config.example.toml `
+  --profile .local/transform.env `
+  --source workplace-relations |
+  Tee-Object -FilePath $LiveInspectionPath
+
+if ($LASTEXITCODE -ne 0) { throw 'Live storage inspection failed.' }
+$LiveInspection = Get-Content $LiveInspectionPath | Select-Object -Last 1 | ConvertFrom-Json
+$LiveInspection | ConvertTo-Json -Depth 6
+```
+
+Require `complete=True`. Counts can exceed this run's 12 assets if the persistent stores
+already contain earlier immutable validation records; the manifest views above are the exact
+per-run evidence.
+
+### 8.4 Prove a safe live rerun
+
+Run the exact command from 8.2 again, writing a different summary file. Do not delete Landing
+data, validator state or Docker volumes first:
+
+```powershell
+$LiveRerunSummaryPath = '.local/live-wrc-orchestration-rerun-summary.jsonl'
+
+& $Python -B -m kedra orchestrate --config config.example.toml `
+  --start-date $LiveStart --end-date $LiveEnd --body-id $LiveBody `
+  --ingest-env .local/ingest.env `
+  --transform-env .local/transform.env `
+  --run-directory .local/live-wrc-runs |
+  Tee-Object -FilePath $LiveRerunSummaryPath
+
+if ($LASTEXITCODE -ne 0) { throw 'The bounded live WRC rerun did not complete.' }
+$LiveRerun = Get-Content $LiveRerunSummaryPath | Select-Object -Last 1 | ConvertFrom-Json
+$LiveRerunIngestion = Get-Content $LiveRerun.ingestion_manifest_path |
+  Select-Object -Last 1 | ConvertFrom-Json
+$LiveRerunTransformation = Get-Content $LiveRerun.transformation_log_path |
+  Select-Object -Last 1 | ConvertFrom-Json
+
+$LiveRerun | Select-Object ingestion_status, transformation_status, complete
+$LiveRerunIngestion | Select-Object stored_files, failed_documents, created_objects, `
+  reused_objects, inserted_metadata_versions, reused_metadata_versions, complete
+$LiveRerunTransformation | Select-Object selected_assets, failed_assets, created_objects, `
+  reused_objects, inserted_metadata_versions, reused_metadata_versions, complete
+```
+
+Require complete summaries and zero failures. Identical downloaded bytes must reuse their
+existing objects and metadata. WRC HTML currently has no trustworthy `ETag` or
+`Last-Modified`, so the rerun fetches it again to check freshness. If volatile raw HTML bytes
+change, a new immutable Landing version is correct; the run must never overwrite or delete an
+older version.
+
+### 8.5 Use an evaluator-supplied range
 
 First run `discover` over the exact inclusive dates with no `--body-id`, then review every
 partition summary and the final totals. Only after discovery reconciles should you run the
@@ -420,9 +507,10 @@ After the commands above, the following evidence should be available:
 
 ## Known limitations
 
-- The bounded 2026-09-02 check revalidated one 12-record WRC listing and one substantive HTML
-  decision. A successful execution of step 8 adds live storage/transformation evidence only
-  for that exact scope; it does not establish other dates, all formats or public throughput.
+- The bounded 2026-09-02 run completed the 12-record WRC listing, downloaded all 12 live HTML
+  decisions, created 12 Landing objects/metadata versions and transformed all 12 into the
+  separate output stores. This proves only that exact scope; it does not establish other
+  dates, all formats or public throughput.
 - A local file hash can identify bytes only after receiving them. If an HTML response has no
   ETag or Last-Modified value, the freshness-first policy downloads the body again to detect
   changes. The unconditional "do not re-download unchanged files" wording therefore remains
