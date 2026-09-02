@@ -80,6 +80,7 @@ def load_ingestion_manifest(
     expected_end_date: date,
     expected_source: str,
     configured_body_ids: Sequence[str],
+    expected_body_ids: Sequence[str] | None = None,
 ) -> IngestionManifest:
     """Validate a JSONL ingestion log as an exact transformation handoff."""
     try:
@@ -126,6 +127,8 @@ def load_ingestion_manifest(
         or any(body_id not in configured_body_ids for body_id in body_ids)
     ):
         raise _manifest_error("invalid_ingestion_manifest")
+    if expected_body_ids is not None and tuple(body_ids) != tuple(expected_body_ids):
+        raise _manifest_error("ingestion_manifest_scope_mismatch")
     stored_files = summary.get("stored_files")
     successful_records = summary.get("successfully_available_records")
     if (
@@ -669,6 +672,8 @@ def run_transformation(
     date_range: DateRange,
     manifest_path: Path,
     stream: TextIO,
+    *,
+    expected_body_ids: Sequence[str] | None = None,
 ) -> int:
     """Run the standalone storage-to-storage transformation without source HTTP access."""
     run_id = uuid4().hex
@@ -685,6 +690,7 @@ def run_transformation(
             end_date,
             settings.source.name,
             settings.source.body_ids,
+            expected_body_ids,
         )
     except ManifestError as error:
         write(

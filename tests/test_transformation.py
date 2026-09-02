@@ -208,6 +208,21 @@ def test_complete_ingestion_manifest_selects_exact_versions_and_binds_scope(tmp_
     assert select_manifest_documents([first[0], second[0]], manifest) == [first[0]]
 
 
+def test_manifest_rejects_a_body_subset_that_differs_from_the_requested_scope(tmp_path):
+    manifest_path = tmp_path / "ingestion.jsonl"
+    write_manifest(manifest_path, [])
+
+    with pytest.raises(ManifestError, match="ingestion_manifest_scope_mismatch"):
+        load_ingestion_manifest(
+            manifest_path,
+            date(2025, 7, 17),
+            date(2025, 7, 17),
+            "workplace-relations",
+            ("2", "15376"),
+            ("2",),
+        )
+
+
 def test_complete_zero_result_manifest_is_valid_but_an_incomplete_run_is_not(tmp_path):
     empty_path = tmp_path / "empty.jsonl"
     write_manifest(empty_path, [])

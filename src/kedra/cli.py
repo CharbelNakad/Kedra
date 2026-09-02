@@ -3,7 +3,9 @@
 import argparse
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 from kedra.config import load_settings
 from kedra.dates import DateRange, iter_partitions
@@ -124,6 +126,27 @@ def main(argv: list[str] | None = None) -> int:
                 start, end = partition.website_dates
                 preview.append({"partition_date": last_label, "from": start, "to": end})
     except (OSError, ValueError) as error:
+        if args.command == "orchestrate":
+            print(
+                json.dumps(
+                    {
+                        "run_id": uuid4().hex,
+                        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                        "event": "orchestration_run_summary",
+                        "ingestion_status": "not_started",
+                        "transformation_status": "not_started",
+                        "ingestion_complete": False,
+                        "transformation_complete": False,
+                        "complete": False,
+                        "reason": "configuration_error",
+                        "error": str(error),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 2
         print(f"Configuration error: {error}", file=sys.stderr)
         return 2
     print(

@@ -308,8 +308,10 @@ ingestion, `<dagster-run-id>-transformation.jsonl`. Files are created exclusivel
 rerun gets a new run ID, so prior evidence is retained. Standard output contains one
 `orchestration_run_summary` with the artifact paths and both stage outcomes. Exit code 0
 means both stages completed; incomplete ingestion or transformation returns 3. Invalid
-dates, profiles, body scope or configuration return 2. Use `kedra ingest` and
-`kedra transform` when the stages need to be run independently.
+dates, profiles, body scope or configuration return 2 with a structured summary on standard
+error. Before releasing the manifest to transformation, orchestration requires its source,
+dates and body IDs to equal the requested scope. Use `kedra ingest` and `kedra transform`
+when the stages need to be run independently.
 
 The installed job can be inspected without executing it:
 

@@ -11,7 +11,7 @@ from dagster import Definitions, Failure, Out, job, op
 from kedra.config import Settings, load_settings
 from kedra.dates import DateRange
 from kedra.ingestion import run_ingestion
-from kedra.transformation import run_transformation
+from kedra.transformation import ManifestError, load_ingestion_manifest, run_transformation
 
 PROFILE_KEYS = frozenset(
     {
@@ -93,6 +93,7 @@ TRANSFORM_CONFIG: Mapping[str, Any] = {
     "credential_profile": str,
     "start_date": str,
     "end_date": str,
+    "body_ids": [str],
     "run_directory": str,
 }
 
@@ -110,10 +111,26 @@ def ingest_landing(context) -> str:
     manifest_path = _run_path(run_directory, context.run_id, "ingestion")
     with manifest_path.open("x", encoding="utf-8", newline="\n") as stream:
         exit_code = run_ingestion(settings, date_range, body_ids, stream)
-    if exit_code != 0 or not _stage_completed(manifest_path, "ingestion_run_summary"):
+    validation_reason = None
+    if exit_code == 0:
+        try:
+            load_ingestion_manifest(
+                manifest_path,
+                date_range.start,
+                date_range.end_exclusive - timedelta(days=1),
+                settings.source.name,
+                settings.source.body_ids,
+                body_ids,
+            )
+        except ManifestError as error:
+            validation_reason = error.reason
+    if exit_code != 0 or validation_reason is not None:
         raise Failure(
             description="Ingestion was incomplete; transformation was withheld",
-            metadata={"manifest_path": str(manifest_path)},
+            metadata={
+                "manifest_path": str(manifest_path),
+                "reason": validation_reason or "ingestion_exit_nonzero",
+            },
         )
     context.add_output_metadata({"manifest_path": str(manifest_path)})
     return str(manifest_path)
@@ -126,11 +143,18 @@ def transform_landing(context, ingestion_manifest: str) -> str:
     config_path = Path(config["config_path"])
     settings = load_profile_settings(config_path, Path(config["credential_profile"]))
     date_range = DateRange.from_inputs(config["start_date"], config["end_date"])
+    body_ids = _selected_body_ids(settings, config["body_ids"])
     run_directory = Path(config["run_directory"])
     run_directory.mkdir(parents=True, exist_ok=True)
     log_path = _run_path(run_directory, context.run_id, "transformation")
     with log_path.open("x", encoding="utf-8", newline="\n") as stream:
-        exit_code = run_transformation(settings, date_range, Path(ingestion_manifest), stream)
+        exit_code = run_transformation(
+            settings,
+            date_range,
+            Path(ingestion_manifest),
+            stream,
+            expected_body_ids=body_ids,
+        )
     if exit_code != 0 or not _stage_completed(log_path, "transformation_run_summary"):
         raise Failure(
             description="Transformation did not complete",
@@ -197,6 +221,7 @@ def run_orchestration(
                     "config": {
                         **common_config,
                         "credential_profile": str(transform_profile.resolve()),
+                        "body_ids": list(selected_body_ids),
                     }
                 },
             }
@@ -205,8 +230,20 @@ def run_orchestration(
     )
     manifest_path = _run_path(run_directory, result.run_id, "ingestion")
     transform_log_path = _run_path(run_directory, result.run_id, "transformation")
-    ingestion_complete = result.is_node_success("ingest_landing") and _stage_completed(
-        manifest_path, "ingestion_run_summary"
+    manifest_failure_reason = None
+    try:
+        load_ingestion_manifest(
+            manifest_path,
+            date_range.start,
+            date_range.end_exclusive - timedelta(days=1),
+            ingest_settings.source.name,
+            ingest_settings.source.body_ids,
+            selected_body_ids,
+        )
+    except ManifestError as error:
+        manifest_failure_reason = error.reason
+    ingestion_complete = (
+        result.is_node_success("ingest_landing") and manifest_failure_reason is None
     )
     transformation_complete = result.is_node_success("transform_landing") and _stage_completed(
         transform_log_path, "transformation_run_summary"
@@ -221,7 +258,7 @@ def run_orchestration(
     )
     reason = None
     if not ingestion_complete:
-        reason = "ingestion_incomplete"
+        reason = manifest_failure_reason or "ingestion_incomplete"
     elif not transformation_complete:
         reason = "transformation_incomplete"
     elif not result.success:

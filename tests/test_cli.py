@@ -274,6 +274,42 @@ def test_orchestrate_cli_passes_profiles_and_run_directory_without_process_secre
     assert capsys.readouterr().err == ""
 
 
+def test_orchestration_configuration_failure_is_structured_json(capsys, tmp_path):
+    missing_profile = tmp_path / "missing.env"
+
+    result = main(
+        [
+            "orchestrate",
+            "--config",
+            EXAMPLE,
+            "--start-date",
+            "2025-07-17",
+            "--end-date",
+            "2025-07-17",
+            "--body-id",
+            "15376",
+            "--ingest-env",
+            str(missing_profile),
+            "--transform-env",
+            str(missing_profile),
+            "--run-directory",
+            str(tmp_path / "runs"),
+        ]
+    )
+
+    output = capsys.readouterr()
+    event = json.loads(output.err)
+    assert result == 2
+    assert output.out == ""
+    assert event["event"] == "orchestration_run_summary"
+    assert event["ingestion_status"] == "not_started"
+    assert event["transformation_status"] == "not_started"
+    assert event["complete"] is False
+    assert event["reason"] == "configuration_error"
+    assert event["run_id"]
+    assert event["timestamp"].endswith("Z")
+
+
 @pytest.mark.parametrize("command", ["discover", "ingest"])
 @pytest.mark.parametrize("body_ids", [["unknown"], ["15376", "15376"]])
 def test_discover_cli_rejects_unknown_or_duplicate_body_scope(

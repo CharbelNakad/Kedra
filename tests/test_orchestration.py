@@ -70,14 +70,16 @@ def test_dagster_runs_transformation_only_after_completed_ingestion(tmp_path, mo
         complete_ingestion(stream, settings, date_range, body_ids)
         return 0
 
-    def fake_transformation(settings, date_range, manifest_path, stream):
+    def fake_transformation(settings, date_range, manifest_path, stream, *, expected_body_ids=None):
         calls.append("transformation")
+        assert expected_body_ids == ("15376",)
         manifest = load_ingestion_manifest(
             manifest_path,
             date_range.start,
             date_range.end_exclusive - timedelta(days=1),
             settings.source.name,
             settings.source.body_ids,
+            expected_body_ids,
         )
         assert manifest.run_id == "controlled-ingestion-run"
         stream.write(
@@ -159,7 +161,41 @@ def test_incomplete_ingestion_withholds_transformation(tmp_path, monkeypatch):
     assert summary["transformation_log_path"] is None
     assert summary["ingestion_status"] == "failed"
     assert summary["transformation_status"] == "skipped"
-    assert summary["reason"] == "ingestion_incomplete"
+    assert summary["reason"] == "ingestion_manifest_incomplete"
+
+
+def test_manifest_body_scope_mismatch_withholds_transformation(tmp_path, monkeypatch):
+    ingest_profile, transform_profile = profiles(tmp_path)
+
+    def fake_ingestion(settings, date_range, body_ids, stream):
+        complete_ingestion(stream, settings, date_range, ["2"])
+        return 0
+
+    monkeypatch.setattr("kedra.orchestration.run_ingestion", fake_ingestion)
+    monkeypatch.setattr(
+        "kedra.orchestration.run_transformation",
+        lambda *args, **kwargs: pytest.fail(
+            "A manifest for another body scope must not reach transformation"
+        ),
+    )
+    output = io.StringIO()
+
+    result = run_orchestration(
+        EXAMPLE,
+        DateRange.from_inputs("2025-07-17", "2025-07-17"),
+        ["15376"],
+        ingest_profile,
+        transform_profile,
+        tmp_path / "runs",
+        output,
+    )
+
+    assert result == 3
+    summary = json.loads(output.getvalue())
+    assert summary["body_ids"] == ["15376"]
+    assert summary["ingestion_status"] == "failed"
+    assert summary["transformation_status"] == "skipped"
+    assert summary["reason"] == "ingestion_manifest_scope_mismatch"
 
 
 def test_each_rerun_gets_distinct_append_only_logs(tmp_path, monkeypatch):
@@ -169,7 +205,8 @@ def test_each_rerun_gets_distinct_append_only_logs(tmp_path, monkeypatch):
         complete_ingestion(stream, settings, date_range, body_ids)
         return 0
 
-    def fake_transformation(settings, date_range, manifest_path, stream):
+    def fake_transformation(settings, date_range, manifest_path, stream, *, expected_body_ids=None):
+        assert expected_body_ids == settings.source.body_ids
         stream.write(
             json.dumps(
                 {
