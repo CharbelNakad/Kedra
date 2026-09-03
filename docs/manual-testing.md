@@ -1,25 +1,23 @@
 # Manual end-to-end testing
 
-This guide is the recommended manual validation path. It runs the production Scrapy, Dagster,
-MongoDB and S3-compatible storage code without using pytest. The first walkthrough uses a
-deterministic loopback source so that it is repeatable even when the public Workplace
-Relations site is unavailable or has changed. A separate 1,000-record exercise covers the
-assignment's evaluation volume. The final live section uses the production configuration to
-scrape a bounded Workplace Relations sample through Scrapy, Landing storage and transformation.
+This guide validates the application without using pytest. Complete the shared setup once,
+then choose either the local guide or the live data guide.
 
-## What this proves
-
-| Evidence | What it demonstrates | What it does not claim |
+| Path | What it does | When to use it |
 | --- | --- | --- |
-| Manual Docker-backed walkthrough | Four bodies, date filters, pagination, Scrapy downloads, all four formats, a wrapper/attachment, immutable Landing writes, transformation, Mongo/S3 inspection and an idempotent rerun | Current WRC selectors or public-site throughput |
-| Direct 1,000-record exercise | 100 listing pages, bounded concurrency/memory, retries, exact failure accounting, recovery and transformation/rerun reuse | Docker capacity, production durability or a live scrape |
-| Bounded WRC run | Current selectors, Scrapy document downloads, Landing writes and transformation for the exact body/date scope tested | Other dates, unobserved formats or a maximum safe request rate |
+| Local guide | Runs the production Scrapy, Dagster, MongoDB and S3-compatible storage code against a deterministic loopback source, then exercises 1,000 records in memory | Repeatable development, demonstrations and full failure/rerun checks |
+| Live data guide | Runs bounded discovery, ingestion and transformation against Workplace Relations | Final proof that the current public site works with the production pipeline |
 
-The assignment states a validation volume of approximately 500-1,000 documents and asks for
-a design that could evolve to roughly 1,000 times that size. It does not require downloading
-more than 1,000 public documents as routine validation.
+The local and live guides write to the same persistent storage services but use distinct
+source names. Neither guide deletes or overwrites Landing data.
 
-## Prerequisites
+## 1. Shared setup
+
+**What this section does:** creates the locked Python environment, prepares ignored local
+credentials, starts MongoDB and SeaweedFS, and verifies the storage schema and permissions.
+Complete it before either testing path.
+
+### 1.1 Prerequisites
 
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/)
@@ -27,62 +25,86 @@ more than 1,000 public documents as routine validation.
 - PowerShell 7 or Windows PowerShell 5.1
 - Free loopback ports 27017, 8333 and 18766
 
-Run every command from the repository root. On Linux or macOS, replace
+Run all commands from the repository root. On Linux or macOS, replace
 `.\.venv\Scripts\python.exe` with `.venv/bin/python` and PowerShell backticks with `\`.
 
-## 1. Build the locked Python environment
+### 1.2 Build the locked Python environment
+
+**What this does:** installs exactly the dependency versions recorded in the lock file.
 
 ```powershell
 uv sync --locked --python 3.12 --cache-dir .uv-cache
 $Python = '.\.venv\Scripts\python.exe'
+& $Python -m kedra --help
 ```
 
-Expected result: `uv` finishes successfully and `$Python -m kedra --help` lists
-`check-config`, `discover`, `ingest`, `transform` and `orchestrate`.
+Expected result: `uv` succeeds and the help output lists `check-config`, `discover`,
+`ingest`, `transform` and `orchestrate`.
 
-## 2. Prepare and start persistent local storage
+### 1.3 Prepare and start persistent storage
 
-`prepare` generates ignored local credentials on the first run and reuses them afterward.
-`bootstrap` creates or verifies the two buckets, three collections, validators, indexes and
-restricted ingestion/transformation roles. Neither command resets storage.
+**What this does:** creates local credentials on the first run, starts the Docker services,
+then creates or verifies the buckets, collections, validators, indexes and restricted roles.
+It reuses existing data on later runs.
 
 ```powershell
+$StorageConfig = 'config.example.toml'
+
 docker desktop start
-& $Python -m kedra.storage_admin prepare --config config.demo.toml
+& $Python -m kedra.storage_admin prepare --config $StorageConfig
 docker compose --env-file .local/compose.env config --quiet
 docker compose --env-file .local/compose.env up -d --wait --wait-timeout 90
-& $Python -m kedra.storage_admin bootstrap --config config.demo.toml
+& $Python -m kedra.storage_admin bootstrap --config $StorageConfig
 docker compose --env-file .local/compose.env ps
 ```
 
-Expected result: `prepare` and `bootstrap` print `"status": "ready"`; MongoDB, SeaweedFS and
-the S3 gateway are healthy. Existing volumes and records are retained.
+Expected result: `prepare` and `bootstrap` print `"status": "ready"`; MongoDB,
+SeaweedFS and the S3 gateway are healthy.
 
-Do not use `docker compose down -v`, delete the named volumes, or remove `.local/` as a reset
-procedure. Landing objects and metadata are deliberately append-only.
+Do not use `docker compose down -v`, delete the named volumes, or remove `.local/` as a
+reset procedure. Landing objects and metadata are append-only.
 
-## 3. Start the deterministic source in terminal A
+---
+
+## 2. Local validation guide
+
+**What this guide does:** runs the complete application against a deterministic source on
+`127.0.0.1`. It covers all four bodies, pagination, HTML/PDF/DOC/DOCX files, an attachment,
+exact stored-byte verification, transformation and a validator-backed unchanged rerun. A
+separate direct exercise checks the required 1,000-record volume and failure recovery.
+
+**What it proves:** application behavior, storage permissions, immutable writes, format
+handling, failure accounting and rerun behavior under controlled conditions.
+
+**What it does not prove:** current Workplace Relations selectors or public-site throughput.
+Use the live guide separately for that evidence.
+
+### 2.1 Start the deterministic source in terminal A
+
+**What this does:** starts a local HTTP source with stable pages, assets and ETags. Keep this
+terminal open while completing sections 2.2 through 2.5.
 
 ```powershell
 $Python = '.\.venv\Scripts\python.exe'
 & $Python -B scripts/demo_source.py
 ```
 
-Leave this terminal open. The first JSON line reports 12 records, four body IDs and the
-`2025-07-17` source date. Subsequent lines show each listing or asset HTTP response. The
-server binds only to `127.0.0.1`.
+The first JSON line should report:
 
-The sample contains:
-
-- all four configured body IDs;
+- four configured body IDs;
 - two listing pages per body;
 - 12 logical records and 13 required assets;
 - HTML, PDF, DOC and DOCX responses; and
-- one empty HTML wrapper whose PDF attachment is also required.
+- one HTML wrapper with a required PDF attachment.
 
-## 4. Run the complete pipeline in terminal B
+Subsequent lines record every listing and asset response.
 
-Open a second PowerShell terminal in the repository root:
+### 2.2 Run the complete local pipeline in terminal B
+
+**What this does:** runs ingestion and transformation as dependent Dagster operations.
+Ingestion must complete and produce a manifest before transformation starts.
+
+Open another PowerShell terminal in the repository root:
 
 ```powershell
 $Python = '.\.venv\Scripts\python.exe'
@@ -96,13 +118,12 @@ $FirstSummaryPath = '.local/manual-first-orchestration.jsonl'
   --run-directory .local/manual-runs |
   Tee-Object -FilePath $FirstSummaryPath
 
-if ($LASTEXITCODE -ne 0) { throw 'The first orchestration run did not complete.' }
+if ($LASTEXITCODE -ne 0) { throw 'The first local orchestration run did not complete.' }
 $FirstRun = Get-Content $FirstSummaryPath | Select-Object -Last 1 | ConvertFrom-Json
 $FirstRun | Format-List
 ```
 
-Dagster must show `ingest_landing` succeeding before `transform_landing` starts. The final
-`orchestration_run_summary` must contain:
+Expected orchestration result:
 
 ```text
 ingestion_status       complete
@@ -110,7 +131,10 @@ transformation_status  complete
 complete               True
 ```
 
-Inspect the final structured summary from each stage:
+### 2.3 Check the local run totals
+
+**What this does:** reads the final JSON event from each stage and checks that every advertised
+record and required asset was accounted for.
 
 ```powershell
 $FirstIngestion = Get-Content $FirstRun.ingestion_manifest_path |
@@ -129,53 +153,61 @@ $FirstTransform | Select-Object selected_assets, successfully_transformed_assets
 
 Expected first-run values:
 
-| Field | Expected |
+| Check | Expected |
 | --- | ---: |
-| Advertised/card/distinct/successful records | 12 / 12 / 12 / 12 |
+| Advertised / card / distinct / successful records | 12 / 12 / 12 / 12 |
 | Failed documents | 0 |
-| Downloaded/stored Landing assets | 13 / 13 |
-| New Landing objects/metadata versions | 13 / 13 |
-| Selected/successful transformed assets | 13 / 13 |
+| Downloaded / stored Landing assets | 13 / 13 |
+| New Landing objects / metadata versions | 13 / 13 |
+| Selected / successful transformed assets | 13 / 13 |
 | HTML transformed / binary copied | 4 / 9 |
-| New transformed objects/metadata versions | 13 / 13 |
+| New transformed objects / metadata versions | 13 / 13 |
 
-The extra asset is the required PDF belonging to the HTML wrapper record.
+The thirteenth asset is the PDF attachment belonging to the HTML wrapper record.
 
-## 5. Read Mongo metadata and exact object bytes
+### 2.4 Verify Mongo metadata and exact object bytes
 
-The inspector uses the restricted transformation profile. It performs only Mongo reads and
-S3 `GET` operations, recomputes every SHA-256, checks every stored byte length, verifies all
-transformed-to-Landing links, compares binary outputs byte-for-byte, checks
-`identifier.ext` filenames and exports one sample per format from each bucket.
+**What this does:** uses the restricted transformation profile to read stored metadata and
+objects. The inspector recomputes every SHA-256 and length, resolves every transformed link,
+compares binary outputs byte-for-byte, validates `identifier.ext` filenames and exports one
+sample per format.
 
 ```powershell
+$LocalInspectionPath = '.local/manual-storage-inspection.jsonl'
+
 & $Python -B scripts/inspect_storage.py `
   --config config.demo.toml `
   --profile .local/transform.env `
   --source kedra-manual-demo-v1 `
   --export-directory .local/manual-export `
-  --export-samples-per-format 1
+  --export-samples-per-format 1 |
+  Tee-Object -FilePath $LocalInspectionPath
+
+if ($LASTEXITCODE -ne 0) { throw 'Local storage inspection failed.' }
+$LocalInspection = Get-Content $LocalInspectionPath |
+  Select-Object -Last 1 | ConvertFrom-Json
+$LocalInspection | ConvertTo-Json -Depth 6
 ```
 
 Expected inspection values:
 
 ```text
-complete                                      true
-landing.metadata_versions                    13
-landing.logical_records                      12
-landing.verified_objects                     13
-landing.listed_prefix_objects                13
-landing.unreferenced_prefix_objects           0
-transformed.metadata_versions                13
-transformed.verified_objects                 13
-transformed.listed_prefix_objects            13
-transformed.unreferenced_prefix_objects       0
-cross_checks.resolved_transformed_to_landing_links  13
-cross_checks.binary_exact_copies               9
-cross_checks.html_outputs_with_new_hash        4
+complete                                           true
+landing.metadata_versions                         13
+landing.logical_records                           12
+landing.verified_objects                          13
+landing.listed_prefix_objects                     13
+landing.unreferenced_prefix_objects                0
+transformed.metadata_versions                     13
+transformed.verified_objects                      13
+transformed.listed_prefix_objects                 13
+transformed.unreferenced_prefix_objects            0
+cross_checks.resolved_transformed_to_landing_links 13
+cross_checks.binary_exact_copies                    9
+cross_checks.html_outputs_with_new_hash             4
 ```
 
-List and open the actual exported object bytes:
+List and inspect the exported bytes:
 
 ```powershell
 Get-ChildItem .local/manual-export -Recurse -File |
@@ -189,14 +221,11 @@ Get-Content $RawHtml.FullName
 Get-Content $CleanHtml.FullName
 ```
 
-A substantive raw HTML sample contains demo site header/footer/navigation/button content.
-The transformed sample retains the decision heading, legal paragraph and table while removing
-that chrome. A wrapper sample instead contains a clean attachment index. PDF/DOC/DOCX bytes
-are copied unchanged; the PDF sample is a valid one-page PDF and the DOCX sample is a valid
-ZIP package containing WordprocessingML.
+The raw HTML contains the demo header, footer, navigation and button. The transformed HTML
+retains the decision heading, legal paragraph and table while removing that page chrome. A
+wrapper output contains a clean attachment index. PDF, DOC and DOCX bytes remain unchanged.
 
-For a direct Mongo view, use the local administrator only for this read-only inspection. The
-pipeline itself uses the restricted profiles:
+Optional direct Mongo inspection:
 
 ```powershell
 $RootPassword = (Get-Content .local/mongo-root-password -Raw).Trim()
@@ -216,11 +245,13 @@ docker compose --env-file .local/compose.env exec -T mongo `
 ```
 
 Expected counts are 13 Landing and 13 transformed metadata versions. The sample document
-shows the date, partition, bucket, object key, format and exact file hash required by the PDF.
+shows the source identifier, date, partition, object path, format and exact file hash.
 
-## 6. Prove the unchanged rerun
+### 2.5 Prove an unchanged local rerun
 
-Keep terminal A running and repeat the orchestration command into a second summary file:
+**What this does:** repeats the identical scope while the local source returns trustworthy
+ETags. It proves that unchanged document bodies are not transferred and no immutable version
+is duplicated.
 
 ```powershell
 $SecondSummaryPath = '.local/manual-second-orchestration.jsonl'
@@ -233,7 +264,7 @@ $SecondSummaryPath = '.local/manual-second-orchestration.jsonl'
   --run-directory .local/manual-runs |
   Tee-Object -FilePath $SecondSummaryPath
 
-if ($LASTEXITCODE -ne 0) { throw 'The second orchestration run did not complete.' }
+if ($LASTEXITCODE -ne 0) { throw 'The local rerun did not complete.' }
 $SecondRun = Get-Content $SecondSummaryPath | Select-Object -Last 1 | ConvertFrom-Json
 $SecondIngestion = Get-Content $SecondRun.ingestion_manifest_path |
   Select-Object -Last 1 | ConvertFrom-Json
@@ -260,63 +291,79 @@ Expected rerun values:
 | New transformed objects / metadata | 0 / 0 |
 | Reused transformed objects / metadata | 13 / 13 |
 
-Terminal A must show 13 asset responses with `"status": 304` and
-`"response_body_bytes": 0`. Listing pages are fetched again so the pipeline can still detect
-new or removed decisions. Run the storage inspector again; both collections and both object
-sets must remain at 13 versions with all hashes valid.
+Terminal A should show 13 asset responses with `"status": 304` and
+`"response_body_bytes": 0`. Listing pages are fetched again so new or removed decisions can
+still be detected. Re-run section 2.4; counts must remain unchanged and all hashes must pass.
 
-This is the strongest form of the idempotency requirement because the controlled source
-provides trustworthy ETags. See "Known limits" below for validator-free HTML.
+### 2.6 Exercise 1,000 records and recovery
 
-## 7. Exercise 1,000 records directly
+**What this does:** generates 1,000 deterministic records without contacting WRC or Docker.
+It measures bounded concurrency and Python allocations while injecting retryable and terminal
+failures, recovering the missing records, rerunning persistence and rerunning transformation.
 
 Stop the demo source with Ctrl+C, or leave it running; this exercise uses another loopback
-port and does not contact WRC or Docker. Invoke the standalone exercise directly, not through
-the automated test suite:
+port.
 
 ```powershell
 & $Python -B scripts/reliability_exercise.py --records 1000
 ```
 
-The command must exit 0 with one JSON `reliability_exercise_summary` containing:
+The command must exit 0 with one `reliability_exercise_summary` containing:
 
 - `records: 1000` and `pages: 100`;
 - 250 HTML, PDF, DOC and DOCX assets;
 - recovered 429, 503 and timeout attempts;
-- a first pass of 998 successful and two explicitly failed records;
-- recovery creating only the two missing objects and metadata versions;
+- 998 initial successes and two explicitly failed records;
+- recovery creating only the two missing versions;
 - an unchanged persistence rerun reusing all 1,000 versions;
 - transformation creating, then reusing, all 1,000 outputs;
-- maximum active requests no greater than the configured concurrency; and
+- maximum active requests no greater than configured concurrency; and
 - `complete: true`.
 
-Elapsed time is measured, not asserted, because workstation performance varies. Peak memory
-is Python allocation data from `tracemalloc`; it excludes native libraries and Docker. The
-exercise uses in-memory storage so it cannot pollute or delete Landing. The smaller manual
-walkthrough above separately proves the real Docker storage and permission path.
+Elapsed time is measured rather than asserted because workstation performance varies. Peak
+memory is Python allocation data from `tracemalloc`; it excludes native libraries and
+Docker. The exercise uses in-memory adapters, so it cannot pollute Landing.
 
-## 8. Scrape a bounded Workplace Relations sample
+### 2.7 Local evidence checklist
 
-If you are testing only live WRC data, complete steps 1 and 2 first, then skip directly to
-8.1. Steps 3-7 exercise the deterministic local source and the controlled reliability case;
-they are useful separate evidence but are not part of the live scrape. In step 2,
-`config.example.toml` may be used in place of `config.demo.toml` for `prepare` and `bootstrap`.
+The local path is complete when all of these are true:
 
-`config.example.toml` points to the public Workplace Relations search and configures the
-neutral `Kedra/0.1` user-agent that currently receives complete HTML. The earlier user-agent
-containing `discovery` caused a zero-byte HTTP 200. The fix does not impersonate a browser:
-the same direct HTTP transport works without cookies, JavaScript or a session bootstrap.
+- The first orchestration run completes with 12 records and 13 assets.
+- The inspector validates every Mongo-to-object reference, hash and length.
+- Four HTML outputs have new hashes and nine binary outputs are byte-identical.
+- The unchanged rerun transfers zero asset bodies and creates zero versions.
+- The 1,000-record exercise reports bounded concurrency, complete accounting and successful
+  recovery.
 
-Keep the first public run to one known body and one day. As of 2 September 2026, body `15376`
-on 17 July 2025 advertises 12 records across two listing pages. This is large enough to prove
-real pagination and document downloading without turning manual validation into a bulk scrape.
+---
 
-### 8.1 Verify live discovery before downloading documents
+## 3. Live Workplace Relations guide
 
-Load the restricted ingestion profile because configuration validation requires complete
-settings even though `discover` does not open storage:
+**What this guide does:** first checks current listing selectors and pagination without
+downloading documents. It then runs the production Dagster pipeline for one body and one day,
+inspects the exact run manifest and verifies all matching stored bytes.
+
+**What it proves:** the current public search, real decision downloads, immutable Landing
+writes and transformation work for the exact body/date scope tested.
+
+**What it does not prove:** all historical dates, every document format, or the maximum safe
+public request rate. Keep this test bounded and do not turn it into a bulk scrape.
+
+As of 2 September 2026, body `15376` on 17 July 2025 advertises 12 decisions across two
+listing pages. This is a useful small sample because it proves real pagination.
+
+`config.example.toml` uses a neutral `Kedra/0.1` user-agent. A previous user-agent string
+containing `discovery` received zero-byte HTTP 200 responses. The current direct HTTP path
+works without browser impersonation, cookies, JavaScript or a session bootstrap.
+
+### 3.1 Load the live profile and choose the bounded scope
+
+**What this does:** loads the restricted ingestion credentials into the current PowerShell
+process and declares one body/day for every subsequent live command.
 
 ```powershell
+$Python = '.\.venv\Scripts\python.exe'
+
 Get-Content .local/ingest.env | ForEach-Object {
   $Name, $Value = $_ -split '=', 2
   [Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
@@ -325,6 +372,14 @@ Get-Content .local/ingest.env | ForEach-Object {
 $LiveStart = '2025-07-17'
 $LiveEnd = '2025-07-17'
 $LiveBody = '15376'
+```
+
+### 3.2 Verify live discovery before downloading documents
+
+**What this does:** sends only the bounded listing requests and validates the advertised
+count, parsed cards and pagination. It does not download or store decision files.
+
+```powershell
 $LiveDiscoveryPath = '.local/live-wrc-discovery.jsonl'
 
 & $Python -B -m kedra discover --config config.example.toml `
@@ -344,20 +399,19 @@ $LiveDiscovery | Select-Object body_partition_count, advertised_total, distinct_
   failed_listing_pages, known_missing_records, complete
 ```
 
-Expected current result: `pages_seen=2`, `advertised_total=12`, `distinct_records=12`, no
-failed or missing records, and both summaries complete. If the count has legitimately changed,
-the advertised total and received cards must still reconcile. If the log instead contains
-`soft_block_detected`, `empty_listing_response`, an HTTP failure, changed selectors or
-incomplete pagination, stop and preserve the JSONL evidence. Empty HTTP 200 responses receive
-only the configured bounded cooldown/retries and are never interpreted as zero results.
+Expected current result: two pages, 12 advertised/card/distinct records, no failed or missing
+records, and `complete=True` in both summaries.
 
-### 8.2 Run real WRC ingestion and transformation
+If the public count has legitimately changed, the advertised total and card occurrences must
+still reconcile. Stop before ingestion if the JSONL contains `soft_block_detected`,
+`empty_listing_response`, an HTTP failure, changed selectors, incomplete pagination or
+missing records. Empty HTTP 200 responses are never interpreted as zero results.
 
-The following command runs the production Dagster dependency. Ingestion repeats the bounded
-listing request, downloads every required decision asset, appends the exact response bytes and
-metadata to the immutable Landing bucket/collection, and writes a completed manifest.
-Transformation then reads only those manifested Landing versions and appends outputs to the
-separate transformed bucket/collection.
+### 3.3 Run live ingestion and transformation
+
+**What this does:** repeats the bounded listing request, downloads every required decision
+asset, appends exact bytes and metadata to Landing, and writes a completed ingestion manifest.
+Only then does transformation write to its separate bucket and collection.
 
 ```powershell
 $LiveRunSummaryPath = '.local/live-wrc-orchestration-summary.jsonl'
@@ -377,23 +431,34 @@ $LiveTransformation = Get-Content $LiveRun.transformation_log_path |
   Select-Object -Last 1 | ConvertFrom-Json
 
 $LiveRun | Select-Object ingestion_status, transformation_status, complete
-$LiveIngestion | Select-Object advertised_total, distinct_records, `
-  successfully_available_records, failed_documents, downloaded_files, stored_files, complete
+$LiveIngestion | Select-Object advertised_total, card_occurrences, distinct_records, `
+  successfully_available_records, failed_documents, downloaded_files, stored_files, `
+  created_objects, inserted_metadata_versions, reused_objects, reused_metadata_versions, `
+  complete
 $LiveTransformation | Select-Object selected_assets, successfully_transformed_assets, `
   failed_assets, html_transformed, binary_copied, created_objects, `
   inserted_metadata_versions, reused_objects, reused_metadata_versions, complete
 ```
 
-Require `complete=True` at all three boundaries. For the verified 17 July 2025/body `15376`
-scope, the current result is 12 advertised/distinct/successful decisions, 12 downloaded/stored
-HTML assets, zero failures, and 12 successful HTML transformations. The ingestion count is
-decisions; another scope may have more files when decisions contain attachments or
-continuation pages.
+Require `complete=True` at the orchestration, ingestion and transformation boundaries. For
+the verified scope, the current result is:
 
-### 8.3 Inspect the exact live records, object paths and hashes
+| Check | Verified result |
+| --- | ---: |
+| Advertised / card / distinct / successful decisions | 12 / 12 / 12 / 12 |
+| Listing pages | 2 |
+| Failed documents | 0 |
+| Downloaded / stored assets | 12 / 12 |
+| Successfully transformed assets | 12 |
+| HTML transformed / binary copied | 12 / 0 |
 
-Use the ingestion manifest chosen by Dagster rather than guessing which Mongo records belong
-to the run:
+This scope happens to contain one HTML asset per decision. Another bounded scope may have more
+assets than decisions because a decision can contain attachments or continuation pages.
+
+### 3.4 Inspect the exact live run
+
+**What this does:** reads the manifest selected by Dagster, so the displayed records, object
+paths and hashes belong to this run rather than older data in the persistent stores.
 
 ```powershell
 $LiveEvents = Get-Content $LiveRun.ingestion_manifest_path | ConvertFrom-Json
@@ -410,13 +475,15 @@ $LiveAssets | Select-Object document_format, asset_role, size_bytes, file_hash, 
 "records=$($LiveRecords.Count) assets=$($LiveAssets.Count)"
 ```
 
-Every asset must name `kedra-landing`, have a 64-character SHA-256 `file_hash`, a deterministic
-object key containing that hash, and a nonblank Landing version ID. The verified run reports
-12 records and 12 assets.
+Expected for this scope: 12 records and 12 assets. Every asset must name `kedra-landing`,
+have a 64-character SHA-256 `file_hash`, use a deterministic object key containing that hash,
+and have a nonblank Landing version ID.
 
-Now perform a read-only verification through the restricted transformation role. It reads
-every matching object, recomputes hashes and lengths, validates transformed provenance and
-compares binary outputs byte-for-byte when present:
+### 3.5 Verify the stored live bytes
+
+**What this does:** performs a read-only verification through the restricted transformation
+role. It reads every matching object, recomputes hashes and lengths, validates transformed
+provenance and compares binary outputs byte-for-byte when present.
 
 ```powershell
 $LiveInspectionPath = '.local/live-wrc-storage-inspection.jsonl'
@@ -428,18 +495,18 @@ $LiveInspectionPath = '.local/live-wrc-storage-inspection.jsonl'
   Tee-Object -FilePath $LiveInspectionPath
 
 if ($LASTEXITCODE -ne 0) { throw 'Live storage inspection failed.' }
-$LiveInspection = Get-Content $LiveInspectionPath | Select-Object -Last 1 | ConvertFrom-Json
+$LiveInspection = Get-Content $LiveInspectionPath |
+  Select-Object -Last 1 | ConvertFrom-Json
 $LiveInspection | ConvertTo-Json -Depth 6
 ```
 
-Require `complete=True`. Counts can exceed this run's 12 assets if the persistent stores
-already contain earlier immutable validation records; the manifest views above are the exact
-per-run evidence.
+Require `complete=True`. The aggregate counts can exceed 12 if persistent storage contains
+older immutable WRC runs. Use section 3.4 for exact per-run counts.
 
-### 8.4 Prove a safe live rerun
+### 3.6 Prove a safe live rerun
 
-Run the exact command from 8.2 again, writing a different summary file. Do not delete Landing
-data, validator state or Docker volumes first:
+**What this does:** repeats the exact public scope without deleting state. It proves that
+identical bytes reuse existing immutable objects and metadata.
 
 ```powershell
 $LiveRerunSummaryPath = '.local/live-wrc-orchestration-rerun-summary.jsonl'
@@ -459,77 +526,113 @@ $LiveRerunTransformation = Get-Content $LiveRerun.transformation_log_path |
   Select-Object -Last 1 | ConvertFrom-Json
 
 $LiveRerun | Select-Object ingestion_status, transformation_status, complete
-$LiveRerunIngestion | Select-Object stored_files, failed_documents, created_objects, `
-  reused_objects, inserted_metadata_versions, reused_metadata_versions, complete
+$LiveRerunIngestion | Select-Object downloaded_files, not_modified_files, `
+  stored_files, failed_documents, created_objects, reused_objects, `
+  inserted_metadata_versions, reused_metadata_versions, complete
 $LiveRerunTransformation | Select-Object selected_assets, failed_assets, created_objects, `
   reused_objects, inserted_metadata_versions, reused_metadata_versions, complete
 ```
 
-Require complete summaries and zero failures. Identical downloaded bytes must reuse their
-existing objects and metadata. WRC HTML currently has no trustworthy `ETag` or
-`Last-Modified`, so the rerun fetches it again to check freshness. If volatile raw HTML bytes
-change, a new immutable Landing version is correct; the run must never overwrite or delete an
-older version.
+Require complete summaries and zero failures. Identical downloaded bytes must create zero new
+objects and metadata versions.
 
-### 8.5 Use an evaluator-supplied range
+WRC HTML currently supplies no trustworthy `ETag` or `Last-Modified`, so the freshness-first
+policy downloads it again to detect changes. If volatile raw HTML changes, creating a new
+immutable Landing version is correct; the run must never overwrite or delete the old version.
+This is different from the local ETag-backed rerun in section 2.5.
 
-First run `discover` over the exact inclusive dates with no `--body-id`, then review every
-partition summary and the final totals. Only after discovery reconciles should you run the
-same `orchestrate` command with those dates and no `--body-id`, so all four configured bodies
-are covered. The application automatically splits the range by body and calendar month. Do
-not replace that with the single all-body URL from 2 December 2024 through 2 September 2026:
-its first page advertised 4,911 results, creating an unnecessarily large pagination and retry
-unit. Do not run an unbounded scrape merely to force the total above 1,000.
+### 3.7 Test an evaluator-supplied range
 
-If a live run exits 3, its successfully stored immutable versions remain valid. Use the failed
-URLs and reasons in the manifest, correct the cause and rerun the same scope. Never delete
-Landing records or reset volumes to obtain a clean rerun.
+**What this does:** applies the same safe sequence to a requested date range: discovery first,
+then ingestion only after all listing partitions reconcile.
 
-## Requirement sign-off
+Run `discover` for the exact inclusive dates with no `--body-id`. Review every partition
+summary and the final totals. Only after discovery completes should you run `orchestrate`
+with the same dates and no `--body-id`, covering all four configured bodies. The application
+splits the range by body and calendar month.
 
-After the commands above, the following evidence should be available:
+Do not replace those partitions with the single all-body URL from 2 December 2024 through
+2 September 2026. Its first page advertised 4,911 results, creating an unnecessarily large
+pagination and retry unit. Do not run an unbounded scrape merely to force the total above
+1,000.
 
-| PDF requirement | Manual evidence |
+If a live run exits 3, its successfully stored immutable versions remain valid. Preserve the
+JSONL manifest, use its failed URLs and reasons to diagnose the cause, then rerun the same
+scope. Never delete Landing records or reset volumes to obtain a clean rerun.
+
+### 3.8 Live evidence checklist
+
+The live path is complete when all of these are true:
+
+- Discovery reconciles advertised results, cards and pagination before any document download.
+- Orchestration, ingestion and transformation each report `complete=True`.
+- The ingestion manifest accounts for every decision and asset with zero unexplained failures.
+- Every asset has an immutable object key, exact hash, byte length and Landing version ID.
+- The storage inspector returns `complete=True`.
+- A rerun creates no duplicate version when the downloaded bytes are identical.
+
+---
+
+## 4. Requirement evidence map
+
+**What this section does:** maps each main assignment behavior to the manual evidence produced
+by the two guides.
+
+| Assignment behavior | Evidence |
 | --- | --- |
-| Scrapy, direct HTTP, rate limits | Demo source request log plus ingestion manifest; configuration shows delay, concurrency, timeout, retry and size caps |
-| Every body and date partitions | Four body IDs in the orchestration summary; exact `from`, `to`, `body` filters in listing events; daily demo partition and configurable monthly production default |
-| Metadata fields | Mongo document contains identifier/title, description, reference, date, source URL, partition and provenance |
-| NoSQL and object storage in Docker | Queryable Mongo documents and hash-verified bytes read from separate SeaweedFS buckets |
-| PDF/DOC/DOCX unchanged; HTML cleaned | Nine byte-identical binary outputs and four newly hashed HTML outputs; exported samples are directly inspectable |
-| Paths and SHA-256 | Mongo sample plus inspector recomputation over every stored object |
-| Idempotent rerun | Zero new versions, 13 zero-body 304 responses and 13 reused outputs |
-| Structured logs and failure accounting | JSONL manifests/summaries; the 1,000-record exercise injects and reconciles transient and terminal failures |
-| Separate dependent tasks | Dagster log shows transformation receiving the completed ingestion manifest only after ingestion succeeds |
-| Separate transformed storage | Distinct bucket and collection names plus transformed metadata links back to immutable Landing versions |
-| Live Workplace Relations scrape | Bounded live discovery plus orchestration manifests show reconciled WRC listings, downloaded decision assets and transformed outputs |
-| 500-1,000 document reliability | Direct 1,000-record, 100-page exercise with all formats, recovery, rerun and resource bounds |
-| Design for much larger scale | `ARCHITECTURE.md` explains queued partition work, per-host budgets, streaming, replication, workers, monitoring and backups; it is a design, not a load-test claim |
+| Scrapy direct HTTP with limits | Local and live manifests; configuration records delay, concurrency, timeout, retry and size limits |
+| Four bodies and date partitions | Local run covers all four body IDs; listing events record exact `from`, `to` and `body` filters |
+| Complete pagination and failure accounting | Local two-page fixtures, live two-page sample and the 1,000-record injected failures |
+| Required metadata | Manifest and Mongo views include identifier/title, description, reference, date, source URL, partition and provenance |
+| MongoDB and S3-compatible storage in Docker | Readable Mongo documents and hash-verified SeaweedFS objects |
+| Immutable Landing Zone | Reruns reuse identical versions; no workflow deletes or overwrites Landing |
+| PDF/DOC/DOCX unchanged and HTML cleaned | Local inspector reports nine exact binary copies and four newly hashed HTML outputs |
+| Deterministic paths and SHA-256 | Manifest object keys plus inspector recomputation over stored bytes |
+| Separate dependent tasks | Dagster logs show transformation begins only after a completed ingestion manifest |
+| Separate transformed storage | Distinct bucket and collection with links back to immutable Landing versions |
+| Live Workplace Relations data | Bounded discovery and orchestration for body `15376` on 17 July 2025 |
+| Approximately 500-1,000 records | Direct 1,000-record exercise with all formats, recovery, rerun and resource measurements |
+| Design for much larger scale | `ARCHITECTURE.md` documents partition queues, host budgets, streaming, replication, workers, monitoring and backups |
 
-## Known limitations
+The assignment asks for validation at approximately 500-1,000 documents and a design that
+could evolve to roughly 1,000 times that size. It does not require downloading more than
+1,000 public documents during routine validation.
 
-- The bounded 2026-09-02 run completed the 12-record WRC listing, downloaded all 12 live HTML
-  decisions, created 12 Landing objects/metadata versions and transformed all 12 into the
-  separate output stores. This proves only that exact scope; it does not establish other
-  dates, all formats or public throughput.
-- A local file hash can identify bytes only after receiving them. If an HTML response has no
-  ETag or Last-Modified value, the freshness-first policy downloads the body again to detect
-  changes. The unconditional "do not re-download unchanged files" wording therefore remains
-  a literal gap for validator-free HTML. Trusting a local cache would avoid the transfer but
-  could silently retain stale legal content.
-- The 1,000-record exercise uses in-memory adapters. Docker-backed behavior is proven on the
-  smaller deterministic run, not by a 1,000-object persistent load test.
-- The local deployment is single-process and single-node, with no replication, automated
-  backup, distributed queue or production disaster-recovery validation.
-- Live DOC/DOCX and multi-page continuation layouts remain unobserved. The scraper rejects
-  unrecognized or off-host assets rather than silently accepting them.
+## 5. Known limitations
 
-## Safe shutdown and later reuse
+**What this section does:** states what the evidence does not establish, so test results are
+not overstated.
 
-Stop the loopback source with Ctrl+C. To stop the storage services without deleting data:
+- The bounded 2 September 2026 validation completed 12 WRC decisions for body `15376` on
+  17 July 2025. It proves only that scope, not every historical date or public throughput.
+- A local hash identifies bytes only after they arrive. If HTML has no ETag or Last-Modified,
+  the freshness-first policy downloads it again. The literal “do not re-download unchanged
+  files” guarantee cannot be met for validator-free HTML without accepting stale-cache risk.
+- The 1,000-record exercise uses in-memory adapters. Docker-backed storage and permissions are
+  proven by the smaller deterministic and live runs, not a 1,000-object persistent load test.
+- The local deployment is single-process and single-node. Replication, automated backups,
+  distributed queues and disaster recovery are design proposals rather than validated runtime
+  features.
+- Live DOC, DOCX and multi-page continuation layouts remain unobserved. The scraper rejects
+  unrecognized and off-host assets rather than silently accepting them.
+
+## 6. Safe shutdown and later reuse
+
+**What this section does:** stops processes while preserving all immutable evidence and local
+credentials.
+
+Stop `scripts/demo_source.py` with Ctrl+C if it is running. Stop storage without deleting
+data:
 
 ```powershell
 docker compose --env-file .local/compose.env stop
 ```
 
-Resume later with `up -d --wait`; rerun `prepare` and `bootstrap` to verify configuration and
-permissions. Never delete Landing records or volumes as a cleanup step.
+Resume later with:
+
+```powershell
+docker compose --env-file .local/compose.env up -d --wait --wait-timeout 90
+& $Python -m kedra.storage_admin bootstrap --config config.example.toml
+```
+
+Never delete Landing records or volumes as a cleanup step.
